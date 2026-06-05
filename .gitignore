@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+backend/data/*.sqlite3
+backend/data/*.sqlite3-*
+backend/data/*.log
+backend/data/*.err.log
+backend/data/uvicorn_import_probe.txt
+tests/outputs/

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>东南大学官网智能检索</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="search-panel">
+        <div class="title-row">
+          <div>
+            <h1>东南大学官网智能检索</h1>
+            <p>先由 AI 理解你的自然语言，再检索官网公开资料，最后只基于来源总结。</p>
+          </div>
+          <button id="crawlButton" class="secondary-button" type="button">更新索引</button>
+        </div>
+
+        <form id="searchForm" class="search-form">
+          <div class="query-row">
+            <input
+              id="queryInput"
+              name="query"
+              placeholder="例如：计算机学院大二能不能转专业？"
+              autocomplete="off"
+              required
+            />
+            <button type="submit">检索</button>
+          </div>
+
+          <div class="profile-grid">
+            <label>
+              学院
+              <input id="collegeInput" placeholder="计算机科学与工程学院" />
+            </label>
+            <label>
+              年级
+              <input id="gradeInput" placeholder="2023级 / 大二" />
+            </label>
+            <label>
+              身份
+              <select id="studentTypeInput">
+                <option value="">不限定</option>
+                <option value="本科生">本科生</option>
+                <option value="研究生">研究生</option>
+                <option value="留学生">留学生</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="quick-row" aria-label="常用检索">
+            <button type="button" data-query="四六级什么时候报名">四六级</button>
+            <button type="button" data-query="2025-2026学年校历原文">校历</button>
+            <button type="button" data-query="转专业需要什么条件">转专业</button>
+            <button type="button" data-query="缓考怎么申请">缓考</button>
+            <button type="button" data-query="最近教务处有什么通知">最新通知</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="status" class="status" hidden></section>
+
+      <section id="planPanel" class="plan-panel" hidden>
+        <h2>AI 检索规划</h2>
+        <pre id="planJson"></pre>
+      </section>
+
+      <section id="answerPanel" class="answer-panel" hidden>
+        <h2>AI 总结</h2>
+        <div id="warningList" class="warning-list" hidden></div>
+        <div id="answerText" class="answer-text"></div>
+      </section>
+
+      <section id="evidencePanel" class="evidence-panel" hidden>
+        <h2>依据片段</h2>
+        <div id="evidenceList"></div>
+      </section>
+
+      <section id="judgePanel" class="evidence-panel" hidden>
+        <h2>证据审查</h2>
+        <div id="judgeSummary" class="judge-summary"></div>
+        <div id="judgeList" class="judge-list"></div>
+      </section>
+
+      <section id="resultsPanel" class="results-panel" hidden>
+        <h2>参考消息源</h2>
+        <div id="results"></div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
