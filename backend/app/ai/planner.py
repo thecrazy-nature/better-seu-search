@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-from functools import lru_cache
 from typing import Any
 
 from pydantic import ValidationError
@@ -10,7 +9,7 @@ from pydantic import ValidationError
 from ..config import settings
 from ..models import QueryPlan, UserProfile
 from ..search.synonyms import SYNONYMS, expand_terms
-from .client import make_ai_client
+from .client import AIUnavailableError, make_ai_client
 from .presets import OUTPUT_PRESETS, output_preset_for_intent
 from .prompts import QUERY_PLANNER_SYSTEM
 
@@ -28,6 +27,8 @@ ELIGIBILITY_RE = re.compile(r"(能不能|可不可以|可以.*吗|是否|符合|
 ENTRY_RE = re.compile(r"(入口|系统|平台|网址|链接|在哪|在哪里|哪里|登录|信息门户|办事大厅|下载专区)")
 EXCEPTION_RE = re.compile(r"(特殊|突发|紧急|例外|逾期|补办|报备|告知|无效|不得|不能|不予|取消|未提前|未及时)")
 COMPARISON_RE = re.compile(r"(对比|不同|区别|差异|有什么不同|和.*比)")
+DOCUMENT_LOOKUP_RE = re.compile(r"(原文|链接|网址|URL|url|PDF|pdf|附件|下载|通知链接|文件链接|帮我找|找一下|找一找|在哪里下载)")
+CONTENT_QUESTION_RE = re.compile(r"(有什么要求|什么要求|有哪些要求|有什么不同|什么时候|啥时候|时间|能不能|可不可以|怎么|如何|流程|材料|入口|系统|截止|条件|资格|总结)")
 AVAILABILITY_RE = re.compile(r"(现在|当前|还能|还可以|还来得及|截止了吗|截止没|能不能.*申请|能不能.*报名)")
 LATEST_RE = re.compile(r"(最近|最新|今天|本周|这周|新发)")
 OFF_TOPIC_RE = re.compile(r"(吃什么|吃啥|外卖|天气|电影|游戏|股票|彩票|闲聊|笑话)")
@@ -49,25 +50,16 @@ class QueryPlanner:
 
     def plan(self, user_query: str, profile: UserProfile | None = None) -> QueryPlan:
         profile = profile or UserProfile()
-        cache_key = json.dumps(profile.model_dump(exclude_none=True), ensure_ascii=False, sort_keys=True)
-        cached = self._plan_cached(user_query.strip(), cache_key)
-        if cached:
-            return cached.model_copy(deep=True)
-        if self.client and self._ai_planner_enabled(user_query):
-            ai_plan = self._plan_with_ai(user_query, profile)
-            if ai_plan:
-                return ai_plan
-        return self._plan_with_rules(user_query, profile)
-
-    @lru_cache(maxsize=512)
-    def _plan_cached(self, user_query: str, profile_json: str) -> QueryPlan | None:
-        if self.client:
-            return None
-        try:
-            profile = UserProfile(**json.loads(profile_json))
-        except Exception:
-            profile = UserProfile()
-        return self._plan_with_rules(user_query, profile)
+        if not self.client:
+            raise AIUnavailableError("AI Planner 不可用：未配置 API Key 或 AI 客户端初始化失败。")
+        if not self._ai_planner_enabled(user_query):
+            if self._looks_off_topic(user_query.strip()):
+                return self._unknown_plan(user_query)
+            raise AIUnavailableError("AI Planner 已被配置关闭，无法理解用户问题。")
+        ai_plan = self._plan_with_ai(user_query, profile)
+        if ai_plan:
+            return ai_plan
+        raise AIUnavailableError("AI Planner 调用失败或返回内容不可解析。")
 
     def _plan_with_ai(self, user_query: str, profile: UserProfile) -> QueryPlan | None:
         try:
@@ -91,11 +83,27 @@ class QueryPlanner:
             )
             content = response.choices[0].message.content or "{}"
             data = json.loads(content)
-            return self._normalize_plan_data(data, user_query, profile)
+            return self._normalize_ai_plan_data(data, user_query, profile)
         except Exception:
             return None
 
-    def _normalize_plan_data(self, data: dict[str, Any], user_query: str, profile: UserProfile) -> QueryPlan | None:
+    @staticmethod
+    def _unknown_plan(user_query: str) -> QueryPlan:
+        return QueryPlan(
+            intent="unknown",
+            confidence=1.0,
+            normalized_query=user_query.strip() or user_query,
+            sub_questions=[],
+            retrieval_keywords=[],
+            expanded_queries=[],
+            entities={"requested_slots": []},
+            filters={},
+            need_answer_summary=False,
+            output_preset=output_preset_for_intent("unknown"),
+            notes="AI Planner 未调用：问题不属于学校官网公开信息检索范围。",
+        )
+
+    def _normalize_ai_plan_data(self, data: dict[str, Any], user_query: str, profile: UserProfile) -> QueryPlan | None:
         data = dict(data or {})
         data["normalized_query"] = str(data.get("normalized_query") or user_query).strip() or user_query
         data["sub_questions"] = self._as_list(data.get("sub_questions"))
@@ -131,12 +139,19 @@ class QueryPlanner:
         return self._postprocess_ai_plan(plan, user_query, profile)
 
     def _postprocess_ai_plan(self, plan: QueryPlan, user_query: str, profile: UserProfile) -> QueryPlan:
-        """Keep the AI planner in charge while filling safety-critical fields."""
+        return self._apply_safety_normalization(plan, user_query, profile)
+
+    def _apply_safety_normalization(self, plan: QueryPlan, user_query: str, profile: UserProfile) -> QueryPlan:
+        """Keep AI understanding intact while filling safety-critical fields."""
         text = user_query.strip()
-        if self._looks_off_topic(text):
-            plan.intent = "unknown"
+        surface_intent = self._safety_intent_override(text, plan.intent)
+        if surface_intent != plan.intent:
+            plan.intent = surface_intent
+        if plan.intent in {"unknown", "find_document", "attachment_query", "latest_updates"}:
             plan.need_answer_summary = False
-            plan.output_preset = output_preset_for_intent(plan.intent)
+        elif plan.intent in {"deadline_query", "process_guide", "eligibility_query", "profile_query", "answer_question"}:
+            plan.need_answer_summary = True
+        plan.output_preset = output_preset_for_intent(plan.intent)
 
         text_college = self._normalize_college(self._first_match(COLLEGE_RE, text))
         profile_college = self._normalize_college(profile.college)
@@ -156,116 +171,16 @@ class QueryPlanner:
         plan.authority_preference = self._normalize_college(
             plan.authority_preference or self._extract_authority_preference(text)
         )
-        if not self._as_list(plan.entities.get("requested_slots")):
-            plan.entities["requested_slots"] = self._extract_requested_slots(text, plan.intent)
+        plan.entities["requested_slots"] = self._merge_terms(
+            self._as_list(plan.entities.get("requested_slots")),
+            self._extract_requested_slots(text, plan.intent),
+        )
         if not plan.sub_questions:
             plan.sub_questions = [plan.normalized_query]
         if not plan.retrieval_keywords:
             plan.retrieval_keywords = self._minimal_retrieval_keywords(plan, profile)
         if not plan.output_preset or plan.output_preset not in OUTPUT_PRESETS:
             plan.output_preset = output_preset_for_intent(plan.intent)
-        return plan
-
-    def _plan_with_rules(self, user_query: str, profile: UserProfile) -> QueryPlan:
-        text = user_query.strip()
-        intent = "answer_question"
-        need_summary = True
-        if self._looks_off_topic(text):
-            intent = "unknown"
-            need_summary = False
-        elif re.search(r"(链接|原文|通知|公告|文件|找一下|找一找)", text):
-            intent = "find_document"
-            need_summary = False
-        if ATTACHMENT_RE.search(text):
-            intent = "attachment_query"
-            need_summary = False
-        if TIME_QUESTION_RE.search(text):
-            intent = "deadline_query"
-            need_summary = True
-        if PROCESS_RE.search(text) and intent != "attachment_query":
-            intent = "process_guide"
-            need_summary = True
-        if ELIGIBILITY_RE.search(text):
-            intent = "eligibility_query"
-            need_summary = True
-        if LATEST_RE.search(text) and intent != "unknown" and not TIME_QUESTION_RE.search(text):
-            intent = "latest_updates"
-            need_summary = False
-        if intent in {"answer_question", "latest_updates"} and re.search(r"(学院|20\d{2}\s*级|大[一二三四]|本科生|研究生)", text) and re.search(r"(最近|最新|通知|教务)", text):
-            intent = "profile_query"
-            need_summary = False
-        if self._looks_like_profile_stage_query(text):
-            intent = "profile_query"
-            need_summary = True
-        if re.search(r"(学院|20\d{2}\s*级|大[一二三四]|本科生|研究生)", text):
-            if intent == "answer_question":
-                intent = "profile_query"
-        if re.search(r"(对比|不同|区别|差异|有什么不同|和.*比)", text):
-            intent = "answer_question"
-            need_summary = True
-
-        college = self._normalize_college(self._first_match(COLLEGE_RE, text)) or self._normalize_college(profile.college)
-        grade = self._first_match(GRADE_RE, text) or profile.grade
-        student_type = self._first_match(STUDENT_TYPE_RE, text) or profile.student_type
-        topic = self._extract_topic(text)
-        action = self._extract_action(text)
-        normalized = " ".join(item for item in [topic, action] if item) or self._normalize_query_text(text)
-        calendar_focus = self._extract_calendar_focus(text) if topic == "校历" else None
-        if calendar_focus and calendar_focus not in normalized:
-            normalized = f"{topic} {calendar_focus}" if topic else calendar_focus
-        expanded = expand_terms(normalized)
-        short_year = re.search(r"(\d{2})\s*届", text)
-        if short_year:
-            expanded = self._merge_terms(
-                expanded,
-                [
-                    f"20{short_year.group(1)}届",
-                    f"20{short_year.group(1)}届毕业班",
-                    f"20{short_year.group(1)}届毕业班同学选课学分核对",
-                ],
-            )
-        if calendar_focus:
-            expanded = self._merge_terms(expanded, [f"{calendar_focus}安排"])
-        if college:
-            expanded = self._merge_terms(expanded, [college, "计算机学院"] if "计算机" in college else [college])
-        if grade == "大二":
-            expanded = self._merge_terms(expanded, ["2024级", "二年级", "大二"])
-        elif grade:
-            expanded = self._merge_terms(expanded, [grade])
-        exclude_terms = self._extract_exclude_terms(text)
-        time_scope = self._extract_time_scope(text)
-        authority_preference = self._normalize_college(self._extract_authority_preference(text))
-
-        plan = QueryPlan(
-            intent=intent,
-            confidence=0.68,
-            normalized_query=normalized or text,
-            sub_questions=[],
-            retrieval_keywords=[],
-            expanded_queries=expanded,
-            entities={
-                "topic": topic,
-                "calendar_focus": calendar_focus,
-                "action": action,
-                "college": college,
-                "grade": grade,
-                "student_type": student_type,
-                "requested_slots": self._extract_requested_slots(text, intent),
-            },
-            filters={
-                "college": college,
-                "grade": grade,
-                "student_type": student_type,
-            },
-            exclude_terms=exclude_terms,
-            time_scope=time_scope,
-            authority_preference=authority_preference,
-            need_answer_summary=need_summary,
-            output_preset=output_preset_for_intent(intent),
-            notes="本地规则解析结果；当 AI 未配置、网络不可用或调用失败时使用。",
-        )
-        plan.sub_questions = self._build_sub_questions(text, plan)
-        plan.retrieval_keywords = self._build_retrieval_keywords(text, plan, profile)
         return plan
 
     @staticmethod
@@ -313,6 +228,7 @@ class QueryPlanner:
             "补考": ["补考安排", "补考安排表"],
             "评教": ["评教系统", "评教入口", "期末评教"],
             "成绩": ["成绩复核", "成绩单", "成绩打印"],
+            "重修": ["挂科", "不及格重修", "及格重修", "课程重修"],
             "辅修": ["微专业"],
         }
         for topic, aliases in extra_topics.items():
@@ -431,6 +347,8 @@ class QueryPlanner:
         if not value:
             return None
         compact = value.replace(" ", "")
+        if "和" in compact:
+            compact = compact.split("和")[-1]
         return COLLEGE_ALIASES.get(compact, compact)
 
     @staticmethod
@@ -515,6 +433,52 @@ class QueryPlanner:
     @staticmethod
     def _looks_like_profile_stage_query(text: str) -> bool:
         return bool(PROFILE_STAGE_RE.search(text) and PROFILE_NEED_RE.search(text))
+
+    @staticmethod
+    def _safety_intent_override(text: str, current_intent: str = "answer_question") -> str:
+        """Correct only high-confidence intent mistakes in the AI plan."""
+        if QueryPlanner._looks_off_topic(text):
+            return "unknown"
+        if QueryPlanner._looks_like_latest_query(text):
+            if re.search(r"(学院|20\d{2}\s*级|大[一二三四]|本科生|研究生)", text):
+                return "profile_query"
+            return "latest_updates"
+        if QueryPlanner._looks_like_attachment_lookup(text):
+            return "attachment_query"
+        if COMPARISON_RE.search(text):
+            return "answer_question"
+        if QueryPlanner._looks_like_time_query(text):
+            return "deadline_query"
+        if ELIGIBILITY_RE.search(text):
+            return "eligibility_query"
+        if PROCESS_RE.search(text):
+            return "process_guide"
+        if QueryPlanner._looks_like_document_lookup(text):
+            return "find_document"
+        if QueryPlanner._looks_like_profile_stage_query(text):
+            return "profile_query"
+        if current_intent == "answer_question" and re.search(r"(学院|20\d{2}\s*级|大[一二三四]|本科生|研究生)", text):
+            return "profile_query"
+        return current_intent
+
+    @staticmethod
+    def _looks_like_time_query(text: str) -> bool:
+        return bool(TIME_QUESTION_RE.search(text) or AVAILABILITY_RE.search(text))
+
+    @staticmethod
+    def _looks_like_latest_query(text: str) -> bool:
+        return bool(LATEST_RE.search(text))
+
+    @staticmethod
+    def _looks_like_attachment_lookup(text: str) -> bool:
+        return bool(ATTACHMENT_RE.search(text) and DOCUMENT_LOOKUP_RE.search(text) and not CONTENT_QUESTION_RE.search(text))
+
+    @staticmethod
+    def _looks_like_document_lookup(text: str) -> bool:
+        return bool(
+            DOCUMENT_LOOKUP_RE.search(text)
+            or (re.search(r"(通知|公告|文件)", text) and not CONTENT_QUESTION_RE.search(text))
+        )
 
     @staticmethod
     def _looks_off_topic(text: str) -> bool:

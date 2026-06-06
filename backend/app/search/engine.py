@@ -13,6 +13,30 @@ from .synonyms import expand_terms
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]{2,}")
 CURRENT_SCOPE_DAYS = 730
 VERY_OLD_SCOPE_DAYS = 1460
+VECTOR_SCAN_LIMIT = 1200
+VECTOR_CANDIDATE_LIMIT = 24
+VECTOR_MIN_SIMILARITY = 0.18
+GENERIC_MATCH_TERMS = {
+    "通知",
+    "公告",
+    "文件",
+    "链接",
+    "原文",
+    "报名",
+    "申请",
+    "打印",
+    "成绩",
+    "附件",
+    "下载",
+    "本科生",
+    "研究生",
+    "教务处",
+    "时间",
+    "查询",
+    "办理",
+    "PDF",
+    "pdf",
+}
 
 
 def _fts_query(text: str) -> str:
@@ -194,8 +218,8 @@ class SearchEngine:
                     if old is None or score > old[1]:
                         rows_by_id[hit_dict["id"]] = (hit_dict, score)
 
-            if plan.intent not in {"latest_updates", "profile_query"} and len(rows_by_id) < max(4, limit // 2):
-                for hit_dict, score in self._vector_candidates(conn, plan, profile, limit=12):
+            if self._should_use_vector_recall(plan):
+                for hit_dict, score in self._vector_candidates(conn, plan, profile, limit=VECTOR_CANDIDATE_LIMIT):
                     old = rows_by_id.get(hit_dict["id"])
                     if old is None or score > old[1]:
                         rows_by_id[hit_dict["id"]] = (hit_dict, score)
@@ -231,20 +255,37 @@ class SearchEngine:
             JOIN documents d ON d.id = c.document_id
             WHERE c.embedding_json IS NOT NULL
             ORDER BY c.id DESC
-            LIMIT 600
+            LIMIT ?
             """
+            ,
+            (VECTOR_SCAN_LIMIT,),
         ).fetchall()
         candidates: list[tuple[dict, float]] = []
         for row in rows:
             if not embedding_json_matches_current(row["embedding_json"]):
                 continue
             similarity = cosine_similarity(query_vector, vector_from_json(row["embedding_json"]))
-            if similarity <= 0.12:
+            if similarity <= VECTOR_MIN_SIMILARITY:
                 continue
             hit_dict = row_to_hit(row, similarity, row["chunk_text"][:260])
-            score = self._score(hit_dict, plan, profile, similarity * 2)
+            score = self._score(hit_dict, plan, profile, self._vector_base_score(similarity, hit_dict, plan))
             candidates.append((hit_dict, score))
         return sorted(candidates, key=lambda item: item[1], reverse=True)[:limit]
+
+    @staticmethod
+    def _should_use_vector_recall(plan: QueryPlan) -> bool:
+        if plan.intent in {"latest_updates", "unknown"}:
+            return False
+        return True
+
+    @staticmethod
+    def _vector_base_score(similarity: float, hit: dict, plan: QueryPlan) -> float:
+        score = similarity * 4.0
+        if hit.get("chunk_kind") == "attachment_text":
+            score -= 0.35
+        if plan.intent == "attachment_query" and hit.get("attachments"):
+            score += 0.25
+        return max(0.1, score)
 
     def _profile_candidates(self, conn, plan: QueryPlan, profile: UserProfile, limit: int) -> list[tuple[dict, float]]:
         terms = self._profile_terms(plan, profile)
@@ -368,6 +409,33 @@ class SearchEngine:
         return " ".join(fields)
 
     @staticmethod
+    def _titleish_haystack(hit: dict) -> str:
+        return " ".join(
+            [
+                hit.get("title") or "",
+                hit.get("heading") or "",
+                hit.get("attachment_name") or "",
+                " ".join(item.get("name", "") for item in hit.get("attachments") or []),
+            ]
+        )
+
+    @staticmethod
+    def _metadata_haystack(hit: dict) -> str:
+        return " ".join(
+            [
+                hit.get("source") or "",
+                hit.get("category") or "",
+                " ".join(hit.get("topics") or []),
+                " ".join(hit.get("keywords") or []),
+                " ".join(hit.get("chunk_tags") or []),
+            ]
+        )
+
+    @staticmethod
+    def _body_haystack(hit: dict) -> str:
+        return " ".join([hit.get("snippet") or "", hit.get("matched_chunk_text") or ""])
+
+    @staticmethod
     def _like_terms(plan: QueryPlan, query_candidates: list[str]) -> list[str]:
         terms: list[str] = []
         for query in query_candidates:
@@ -434,31 +502,56 @@ class SearchEngine:
         score = base_score
         title = hit["title"] or ""
         normalized_query = plan.normalized_query
+        titleish_haystack = self._titleish_haystack(hit)
+        metadata_haystack = self._metadata_haystack(hit)
+        body_haystack = self._body_haystack(hit)
+        haystack_without_body = f"{titleish_haystack} {metadata_haystack}"
+        haystack_with_body = f"{haystack_without_body} {body_haystack}"
+        specific_terms = self._specific_match_terms(plan)
         if normalized_query and normalized_query in title:
             score += 5.0
+        if specific_terms:
+            title_hits = [term for term in specific_terms if term in titleish_haystack]
+            body_hits = [term for term in specific_terms if term in body_haystack]
+            metadata_hits = [
+                term
+                for term in specific_terms
+                if term not in title_hits and term not in body_hits and term in metadata_haystack
+            ]
+            score += min(5.0, len(title_hits) * 1.8)
+            score += min(2.4, len(body_hits) * 0.6)
+            score += min(1.2, len(metadata_hits) * 0.35)
+            if plan.intent in {"find_document", "attachment_query"}:
+                if title_hits:
+                    score += min(4.0, len(title_hits) * 1.5)
+                elif body_hits:
+                    score -= 5.0
+                else:
+                    score -= 6.0
+            elif plan.intent in {"deadline_query", "process_guide", "eligibility_query"} and not (title_hits or body_hits):
+                score -= 1.5
         for query in self._plan_match_terms(plan, 8):
             if query and query in title:
-                score += 2.0
+                score += 0.6 if self._is_generic_match_term(query) else 2.0
             if query and query in hit.get("keywords", []):
-                score += 1.4
+                score += 0.3 if self._is_generic_match_term(query) else 1.4
         topic = plan.entities.get("topic")
         if isinstance(topic, str) and topic:
             topic_terms = self._topic_terms(topic)
-            haystack = self._hit_haystack(hit, include_body=True)
-            title_haystack = self._hit_haystack(hit, include_body=False)
-            if any(term and term in title_haystack for term in topic_terms):
+            if any(term and term in titleish_haystack for term in topic_terms):
                 score += 3.0
-            elif any(term and term in haystack for term in topic_terms):
+            elif any(term and term in body_haystack for term in topic_terms):
                 score += 1.2
+            elif any(term and term in metadata_haystack for term in topic_terms):
+                score += 0.5
             elif plan.intent in {"deadline_query", "process_guide", "eligibility_query"}:
                 score -= 2.5
         action = plan.entities.get("action")
         if isinstance(action, str) and action:
-            haystack = self._hit_haystack(hit, include_body=True)
             if action in title:
-                score += 1.2
-            elif action in haystack:
-                score += 0.4
+                score += 0.4 if self._is_generic_match_term(action) else 1.2
+            elif action in haystack_with_body:
+                score += 0.1 if self._is_generic_match_term(action) else 0.4
 
         if hit["source"] == "教务处":
             score += 0.9
@@ -471,6 +564,10 @@ class SearchEngine:
             score += 2.0
         if plan.intent == "latest_updates":
             score += _recency_bonus(hit["publish_date"]) * 2
+            if re.search(r"(通知|公告|公示|安排|查询)", title):
+                score += 2.2
+            else:
+                score -= 1.2
         else:
             score += _recency_bonus(hit["publish_date"])
         if plan.intent == "deadline_query":
@@ -498,6 +595,40 @@ class SearchEngine:
             elif hit["student_types"] and not _contains_any(hit["student_types"], filter_student_type):
                 score -= 3.0
         return score
+
+    @staticmethod
+    def _specific_match_terms(plan: QueryPlan) -> list[str]:
+        values: list[str] = []
+        for term in SearchEngine._plan_match_terms(plan, 16):
+            compact = re.sub(r"\s+", "", str(term or ""))
+            if compact and not SearchEngine._is_generic_match_term(compact):
+                values.append(compact)
+        topic = plan.entities.get("topic")
+        if isinstance(topic, str) and not SearchEngine._is_generic_match_term(topic):
+            values.append(topic)
+        for key in ("college", "grade", "student_type"):
+            value = plan.filters.get(key) or plan.entities.get(key)
+            if isinstance(value, str) and not SearchEngine._is_generic_match_term(value):
+                values.append(value)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if len(value) < 2 or value.lower() in seen:
+                continue
+            seen.add(value.lower())
+            deduped.append(value)
+        return deduped[:10]
+
+    @staticmethod
+    def _is_generic_match_term(term: str | None) -> bool:
+        if not term:
+            return True
+        compact = re.sub(r"\s+", "", str(term))
+        if compact in GENERIC_MATCH_TERMS:
+            return True
+        if re.fullmatch(r"20\d{2}", compact):
+            return True
+        return len(compact) < 2
 
     @staticmethod
     def _time_scope_bonus(hit: dict, plan: QueryPlan) -> float:

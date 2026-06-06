@@ -35,15 +35,16 @@ class Settings:
         self.ai_timeout_seconds = float(os.getenv("AI_TIMEOUT_SECONDS", "15"))
         self.ai_max_retries = int(os.getenv("AI_MAX_RETRIES", "0"))
         self.ai_planner_mode = os.getenv("AI_PLANNER_MODE", "always").strip().lower()
-        self.ai_evidence_judge_mode = os.getenv("AI_EVIDENCE_JUDGE_MODE", "always").strip().lower()
+        self.ai_reranker_mode = os.getenv("AI_RERANKER_MODE", "auto").strip().lower()
+        self.ai_evidence_judge_mode = os.getenv("AI_EVIDENCE_JUDGE_MODE", "off").strip().lower()
         self.ai_answer_composer_mode = os.getenv("AI_ANSWER_COMPOSER_MODE", "always").strip().lower()
 
         # Backward-compatible aliases for older code and local scripts.
         self.openai_api_key = self.ai_api_key
         self.openai_model = self.ai_model
 
-        self.embedding_provider = os.getenv("EMBEDDING_PROVIDER", "hash").strip().lower()
-        self.embedding_model = os.getenv("EMBEDDING_MODEL", "").strip()
+        self.embedding_provider = os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
+        self.embedding_model = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5").strip()
         self.embedding_api_key = (
             os.getenv("EMBEDDING_API_KEY")
             or os.getenv("OPENAI_API_KEY")

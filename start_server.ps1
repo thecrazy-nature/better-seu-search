@@ -55,7 +55,7 @@ function Ensure-Venv {
         return $venvPython
     }
 
-    Write-Output "Creating virtual environment..."
+    Write-Host "Creating virtual environment..."
     & $BootstrapPython -m venv $venvDir
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $venvPython)) {
         throw "Failed to create virtual environment at $venvDir."

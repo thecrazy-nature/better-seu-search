@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -12,6 +12,8 @@ import httpx
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 TESTSET = ROOT / "tests" / "query_testset.jsonl"
 OUTPUT_DIR = ROOT / "tests" / "outputs"
 
@@ -200,28 +202,22 @@ def judge_case(case: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def search_locally(query: str, profile_payload: dict[str, Any], limit: int, disable_ai: bool) -> dict[str, Any]:
-    if disable_ai:
-        for key in ("AI_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
-            os.environ[key] = ""
-
+def search_locally(query: str, profile_payload: dict[str, Any], limit: int) -> dict[str, Any]:
     from backend.app.ai.answerer import Answerer
     from backend.app.ai.planner import QueryPlanner
     from backend.app.ai.evidence_judge import AIEvidenceJudge
+    from backend.app.ai.reranker import AIReranker
     from backend.app.config import settings
     from backend.app.models import UserProfile
     from backend.app.search.engine import SearchEngine
     from backend.app.storage import DocumentStore
-
-    if disable_ai:
-        settings.ai_api_key = ""
-        settings.openai_api_key = ""
 
     store = DocumentStore()
     store.init_db()
     profile = UserProfile(**profile_payload)
     planner = QueryPlanner()
     engine = SearchEngine(store)
+    reranker = AIReranker()
     evidence_judge = AIEvidenceJudge()
     answerer = Answerer()
 
@@ -243,7 +239,20 @@ def search_locally(query: str, profile_payload: dict[str, Any], limit: int, disa
             },
         }
     candidates = engine.search(plan, profile, max(limit * 3, 24))
-    hits, judge_report = evidence_judge.judge(query, plan, candidates, profile, limit)
+    candidates, reranker_report = reranker.rerank(query, plan, candidates, profile)
+    if reranker_report.notes:
+        plan.notes = f"{plan.notes or ''} AI reranker: {reranker_report.notes}".strip()
+    if settings.ai_evidence_judge_mode in {"off", "false", "0", "disabled"}:
+        from backend.app.ai.evidence_judge import EvidenceJudgeReport
+
+        hits = candidates[:limit]
+        judge_report = EvidenceJudgeReport(
+            status="skipped",
+            notes="Evidence Judge 已关闭：本地检索结果直接交给 Fact Reader 总结。",
+            candidate_count=min(len(candidates), limit),
+        )
+    else:
+        hits, judge_report = evidence_judge.judge(query, plan, candidates, profile, limit)
     hits = hits[:limit]
     if judge_report.notes:
         plan.notes = f"{plan.notes or ''} AI evidence judge: {judge_report.notes}".strip()
@@ -262,7 +271,6 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--sleep", type=float, default=0.2)
     parser.add_argument("--mode", choices=["api", "local"], default="api")
-    parser.add_argument("--disable-ai", action="store_true", help="Use deterministic rule/template mode in local eval.")
     parser.add_argument("--timeout", type=float, default=20)
     args = parser.parse_args()
 
@@ -283,7 +291,7 @@ def main() -> None:
         started = time.time()
         try:
             if args.mode == "local":
-                result = search_locally(case["query"], case.get("profile") or {}, args.limit, args.disable_ai)
+                result = search_locally(case["query"], case.get("profile") or {}, args.limit)
             else:
                 response = client.post(f"{args.base_url}/api/search", json=payload)
                 response.raise_for_status()

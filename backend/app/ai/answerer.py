@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any
 
@@ -9,15 +10,17 @@ from ..config import settings
 from ..models import AnswerResult, EvidenceItem, QueryPlan, SearchHit
 from ..storage import DocumentStore
 from .client import make_ai_client
-from .prompts import ANSWER_SYSTEM, FACT_EXTRACTOR_SYSTEM
+from .prompts import FACT_EXTRACTOR_SYSTEM
+from .prompts import LIGHT_READER_SYSTEMS
 from .validator import validate_answer_against_hits
 
 
-FACT_SOURCE_LIMIT = 3
-FACT_PRIMARY_CONTEXT_CHARS = 5600
-FACT_SECONDARY_CONTEXT_CHARS = 3600
-FACT_BODY_WINDOW_CHARS = 560
+FACT_SOURCE_LIMIT = 8
+FACT_PRIMARY_CONTEXT_CHARS = 1700
+FACT_SECONDARY_CONTEXT_CHARS = 1100
+FACT_BODY_WINDOW_CHARS = 360
 FACT_MAX_CARDS = 14
+MAX_PARALLEL_READERS = 3
 FACT_ALLOWED_SLOTS = {
     "answer",
     "time",
@@ -90,12 +93,28 @@ class Answerer:
         if not plan.need_answer_summary:
             return self._finalize_answer(self._document_list_answer(hits, evidence, warnings), hits)
 
-        if self._ai_enabled():
-            ai_answer = self._answer_with_ai_fact_cards(user_query, plan, hits, evidence, warnings)
-            if ai_answer:
-                return self._finalize_answer(ai_answer, hits)
+        if not self._ai_enabled():
+            return self._finalize_answer(
+                self._ai_unavailable_answer(
+                    hits,
+                    warnings,
+                    "AI 摘要不可用：未配置 API Key、AI 客户端初始化失败，或答案生成模块被配置关闭。",
+                ),
+                hits,
+            )
 
-        return self._finalize_answer(self._extractive_answer(hits, evidence, warnings), hits)
+        ai_answer = self._answer_with_ai_fact_cards(user_query, plan, hits, evidence, warnings)
+        if ai_answer:
+            return self._finalize_answer(ai_answer, hits)
+
+        return self._finalize_answer(
+            self._ai_unavailable_answer(
+                hits,
+                warnings,
+                "AI 摘要不可用：Fact Reader 调用失败，或 AI 未能从候选资料中抽取出可用答案。",
+            ),
+            hits,
+        )
 
     def _answer_with_ai_fact_cards(
         self,
@@ -109,16 +128,18 @@ class Answerer:
         if not sources:
             return None
 
-        payload = self._read_facts_with_ai(user_query, plan, sources, evidence, warnings)
+        payload = self._read_facts_with_light_readers(user_query, plan, sources, warnings)
+        if not payload:
+            payload = self._read_facts_with_ai(user_query, plan, sources, evidence, warnings)
         if not payload:
             return None
 
-        facts, rejected_count = self._validate_fact_cards(payload, sources)
+        facts, rejected_count = self._normalize_fact_cards(payload, sources)
         if not facts:
             return None
 
         fact_warnings = self._fact_warnings(payload, rejected_count, warnings)
-        answer = self._compose_answer_from_fact_cards(user_query, plan, payload, facts, sources, fact_warnings)
+        answer = self._answer_from_reader_payload(payload, facts, sources)
         if not answer:
             answer = self._render_fact_card_answer(payload, facts, sources, fact_warnings)
 
@@ -131,6 +152,242 @@ class Answerer:
             evidence=fact_evidence or evidence[:5],
             warnings=fact_warnings,
         )
+
+    def _read_facts_with_light_readers(
+        self,
+        user_query: str,
+        plan: QueryPlan,
+        sources: list[dict[str, Any]],
+        warnings: list[str],
+    ) -> dict[str, Any] | None:
+        tasks = self._reader_tasks(plan)
+        if not tasks:
+            return None
+        if len(tasks) == 1:
+            result = self._read_task_with_ai(user_query, plan, sources, warnings, tasks[0])
+            return self._combine_reader_results([result], sources) if result else None
+
+        results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_READERS, len(tasks))) as executor:
+            futures = [
+                executor.submit(self._read_task_with_ai, user_query, plan, sources, warnings, task)
+                for task in tasks[:MAX_PARALLEL_READERS]
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    results.append(result)
+        return self._combine_reader_results(results, sources) if results else None
+
+    def _read_task_with_ai(
+        self,
+        user_query: str,
+        plan: QueryPlan,
+        sources: list[dict[str, Any]],
+        warnings: list[str],
+        task: str,
+    ) -> dict[str, Any] | None:
+        system = LIGHT_READER_SYSTEMS.get(task)
+        if not system:
+            return None
+        try:
+            response = self.client.chat.completions.create(
+                model=settings.ai_model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "user_query": user_query,
+                                "current_date": date.today().isoformat(),
+                                "query_plan": plan.model_dump(mode="json"),
+                                "reader_task": task,
+                                "requested_slots": self._requested_slots(plan),
+                                "sources": [
+                                    self._public_source_payload(
+                                        self._task_focused_source_payload(source, task),
+                                        include_context=True,
+                                    )
+                                    for source in sources
+                                ],
+                                "warnings": warnings,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+            )
+            payload = self._parse_json_object(response.choices[0].message.content or "")
+        except Exception:
+            return None
+        if not payload:
+            return None
+        payload["task"] = str(payload.get("task") or task)
+        return payload
+
+    def _combine_reader_results(self, results: list[dict[str, Any]], sources: list[dict[str, Any]]) -> dict[str, Any]:
+        ordered_tasks = ["deadline", "eligibility", "process", "material", "comparison", "general"]
+        results = sorted(
+            [result for result in results if isinstance(result, dict)],
+            key=lambda item: ordered_tasks.index(str(item.get("task"))) if str(item.get("task")) in ordered_tasks else 99,
+        )
+        facts: list[dict[str, Any]] = []
+        missing: list[str] = []
+        warnings: list[str] = []
+        sections: list[tuple[str, str]] = []
+        confidences: list[str] = []
+        for result in results:
+            task = str(result.get("task") or "general")
+            section = self._clean_multiline(str(result.get("answer_section") or ""), max_chars=1200)
+            if section and section not in [item[1] for item in sections]:
+                sections.append((task, section))
+            raw_facts = result.get("facts")
+            if isinstance(raw_facts, list):
+                facts.extend(item for item in raw_facts if isinstance(item, dict))
+            missing.extend(str(item) for item in result.get("missing", []) if str(item).strip())
+            warnings.extend(str(item) for item in result.get("warnings", []) if str(item).strip())
+            confidence = str(result.get("confidence") or "").lower()
+            if confidence in {"high", "medium", "low", "none"}:
+                confidences.append(confidence)
+
+        final_answer = self._render_parallel_reader_answer(sections, facts, sources, missing, warnings)
+        direct_answer = sections[0][1] if sections else ""
+        return {
+            "final_answer": final_answer,
+            "direct_answer": direct_answer,
+            "confidence": self._combine_confidence(confidences, facts),
+            "facts": facts,
+            "missing": self._dedupe_strings(missing),
+            "warnings": self._dedupe_strings(warnings),
+        }
+
+    def _render_parallel_reader_answer(
+        self,
+        sections: list[tuple[str, str]],
+        raw_facts: list[dict[str, Any]],
+        sources: list[dict[str, Any]],
+        missing: list[str],
+        warnings: list[str],
+    ) -> str:
+        cleaned_sections: list[tuple[str, str]] = []
+        for task, section in sections:
+            text = re.sub(r"^#+\s*", "", section).strip()
+            text = re.sub(r"^[-•]\s*", "", text).strip()
+            if text:
+                cleaned_sections.append((task, text))
+
+        lead = self._direct_lead_from_sections(cleaned_sections) or self._direct_lead_from_raw_facts(raw_facts)
+        if not lead:
+            lead = "结论：已找到相关官网材料，但没有抽取到足够明确的直接结论。"
+        lead = re.sub(r"^\*\*(.*?)\*\*$", r"\1", lead).strip()
+        if not lead.startswith("结论"):
+            lead = f"结论：{lead}"
+
+        lines = [f"**{lead}**"]
+        labels = {
+            "deadline": "时间信息",
+            "eligibility": "资格与限制",
+            "process": "办理流程",
+            "material": "材料与附件",
+            "comparison": "差异对比",
+            "general": "补充说明",
+        }
+        for task, section in cleaned_sections:
+            body = re.sub(r"^\*\*.*?\*\*\s*", "", section, count=1).strip()
+            if not body:
+                match = re.search(r"\*\*(.*?)\*\*", section)
+                body = match.group(1).strip() if match else section
+            body = body.strip()
+            if not body:
+                continue
+            lines.extend(["", labels.get(task, "依据"), body])
+
+        deduped_missing = self._dedupe_strings(missing)
+        if deduped_missing:
+            lines.append("")
+            lines.append("未找到明确依据")
+            lines.extend(f"- {item}" for item in deduped_missing[:4])
+
+        deduped_warnings = self._dedupe_strings(warnings)
+        if deduped_warnings:
+            lines.append("")
+            lines.append("注意")
+            lines.extend(f"- {item}" for item in deduped_warnings[:3])
+
+        used_refs = []
+        for fact in raw_facts:
+            ref = str(fact.get("source_ref") or "").strip()
+            if ref and ref not in used_refs:
+                used_refs.append(ref)
+        if not used_refs:
+            for _, section in cleaned_sections:
+                for ref in re.findall(r"\[\d+\]", section):
+                    if ref not in used_refs:
+                        used_refs.append(ref)
+
+        lines.extend(["", "参考信息源："])
+        for source in sources:
+            if used_refs and source["ref"] not in used_refs:
+                continue
+            date_part = f"，{source.get('publish_date')}" if source.get("publish_date") else ""
+            lines.append(f"{source['ref']} {source.get('source')}：《{source.get('title')}》{date_part}，{source.get('url')}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _direct_lead_from_sections(sections: list[tuple[str, str]]) -> str:
+        for _, section in sections:
+            match = re.search(r"\*\*(.*?)\*\*", section)
+            if match:
+                return match.group(1).strip()
+            first = re.split(r"\n|。", section, maxsplit=1)[0].strip()
+            if first:
+                return first
+        return ""
+
+    @staticmethod
+    def _direct_lead_from_raw_facts(raw_facts: list[dict[str, Any]]) -> str:
+        for fact in raw_facts:
+            if fact.get("is_direct") and fact.get("claim"):
+                return str(fact.get("claim"))
+        for fact in raw_facts:
+            if fact.get("claim"):
+                return str(fact.get("claim"))
+        return ""
+
+    @staticmethod
+    def _combine_confidence(confidences: list[str], facts: list[dict[str, Any]]) -> str:
+        values = [item for item in confidences if item in {"high", "medium", "low", "none"}]
+        if not values:
+            return "medium" if facts else "none"
+        if all(item == "none" for item in values):
+            return "none"
+        if all(item == "high" for item in values):
+            return "high"
+        if "medium" in values or "high" in values:
+            return "medium"
+        return "low"
+
+    def _reader_tasks(self, plan: QueryPlan) -> list[str]:
+        if plan.intent in {"find_document", "attachment_query", "latest_updates", "unknown"}:
+            return []
+        slots = set(self._requested_slots(plan))
+        tasks: list[str] = []
+        if plan.intent == "deadline_query" or "time" in slots:
+            tasks.append("deadline")
+        if plan.intent == "eligibility_query" or {"audience", "condition", "exception"} & slots:
+            tasks.append("eligibility")
+        if plan.intent == "process_guide" or {"process", "entry"} & slots:
+            tasks.append("process")
+        if "material" in slots:
+            tasks.append("material")
+        if "comparison" in slots:
+            tasks.append("comparison")
+        if not tasks:
+            tasks.append("general")
+        return self._dedupe_strings(tasks)[:MAX_PARALLEL_READERS]
 
     def _read_facts_with_ai(
         self,
@@ -168,44 +425,6 @@ class Answerer:
         except Exception:
             return None
 
-    def _compose_answer_from_fact_cards(
-        self,
-        user_query: str,
-        plan: QueryPlan,
-        payload: dict[str, Any],
-        facts: list[dict[str, Any]],
-        sources: list[dict[str, Any]],
-        warnings: list[str],
-    ) -> str | None:
-        try:
-            response = self.client.chat.completions.create(
-                model=settings.ai_model,
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": ANSWER_SYSTEM},
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "user_query": user_query,
-                                "current_date": date.today().isoformat(),
-                                "query_plan": plan.model_dump(mode="json"),
-                                "sources": [self._public_source_payload(source, include_context=False) for source in sources],
-                                "fact_cards": [self._public_fact(fact) for fact in facts],
-                                "direct_answer_from_reader": payload.get("direct_answer") or "",
-                                "missing": payload.get("missing") or [],
-                                "warnings": warnings,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    },
-                ],
-            )
-            answer = (response.choices[0].message.content or "").strip()
-            return answer or None
-        except Exception:
-            return None
-
     def _source_payload_for_fact_extraction(
         self,
         plan: QueryPlan,
@@ -213,7 +432,7 @@ class Answerer:
     ) -> list[dict[str, Any]]:
         sources: list[dict[str, Any]] = []
         for index, hit in enumerate(hits[:FACT_SOURCE_LIMIT], start=1):
-            max_chars = FACT_PRIMARY_CONTEXT_CHARS if index <= 3 else FACT_SECONDARY_CONTEXT_CHARS
+            max_chars = FACT_PRIMARY_CONTEXT_CHARS if index <= 2 else FACT_SECONDARY_CONTEXT_CHARS
             context = self._source_context_for_reader(hit, plan, max_chars=max_chars)
             attachments = [
                 {"name": item.get("name"), "url": item.get("url")}
@@ -245,13 +464,28 @@ class Answerer:
                     "keywords": hit.keywords,
                     "ai_metadata_hint": ai_metadata_hint,
                     "_hit": hit,
+                    "_plan": plan,
                     "_support_text": self._source_support_text(hit, context, attachments),
                 }
             )
         return sources
 
+    def _task_focused_source_payload(self, source: dict[str, Any], task: str) -> dict[str, Any]:
+        hit = source.get("_hit")
+        plan = source.get("_plan")
+        focused = dict(source)
+        if isinstance(hit, SearchHit) and isinstance(plan, QueryPlan):
+            max_chars = FACT_PRIMARY_CONTEXT_CHARS if source.get("ref") in {"[1]", "[2]"} else FACT_SECONDARY_CONTEXT_CHARS
+            focused["context"] = self._source_context_for_reader_task(hit, plan, task, max_chars=max_chars)
+        return focused
+
     def _source_context_for_reader(self, hit: SearchHit, plan: QueryPlan, max_chars: int) -> str:
+        return self._source_context_for_reader_task(hit, plan, "general", max_chars)
+
+    def _source_context_for_reader_task(self, hit: SearchHit, plan: QueryPlan, task: str, max_chars: int) -> str:
         terms = self._context_terms(plan, hit)
+        task_terms = self._task_context_terms(task)
+        focused_terms = self._dedupe_strings([*task_terms, *terms])[:40]
         header_parts = [
             f"标题：{hit.title}",
             f"来源：{hit.source}",
@@ -275,7 +509,7 @@ class Answerer:
             label = "命中附件片段" if hit.attachment_name else "命中正文片段"
             detail = f"附件《{hit.attachment_name}》" if hit.attachment_name else ""
             page = f"第{hit.page}页" if hit.page else ""
-            matched_block = f"{label}：{detail}{page} {self._clean(hit.matched_chunk_text, max_chars=1400)}".strip()
+            matched_block = f"{label}：{detail}{page} {self._clean(hit.matched_chunk_text, max_chars=520)}".strip()
 
         focused_body_block = ""
         related_chunks_block = ""
@@ -284,23 +518,24 @@ class Answerer:
         row = self.store.get_document(hit.id)
         if row:
             body_text = self._strip_embedded_attachment_text(row["body"] or "")
-            focused_body = self._focused_body_context(body_text, terms, max_chars=1800)
+            focused_body = self._focused_body_context(body_text, focused_terms, max_chars=620)
             if focused_body:
                 focused_body_block = "文章正文相关窗口：\n" + focused_body
 
-            related_chunks = self._related_chunk_context(hit.id, terms, max_chars=2200)
+            related_chunks = self._related_chunk_context(hit.id, focused_terms, task=task, max_chars=650)
             if related_chunks:
                 related_chunks_block = "同篇文章相关文本块：\n" + related_chunks
 
-            body_intro = self._clean(body_text, max_chars=900)
+            body_intro = self._clean(body_text, max_chars=220)
             if body_intro and self._normalize_quote_text(body_intro[:80]) not in self._normalize_quote_text(focused_body):
                 body_intro_block = "文章开头：\n" + body_intro
         elif hit.snippet:
-            snippet_block = "检索摘要：\n" + self._clean(hit.snippet, max_chars=900)
+            snippet_block = "检索摘要：\n" + self._clean(hit.snippet, max_chars=480)
 
         evidence_blocks = self._ordered_context_blocks(
             plan,
             hit,
+            task=task,
             matched_block=matched_block,
             focused_body_block=focused_body_block,
             related_chunks_block=related_chunks_block,
@@ -336,7 +571,7 @@ class Answerer:
             hint["attachment_summaries"] = hint["attachment_summaries"][:6]
         return hint
 
-    def _related_chunk_context(self, doc_id: int, terms: list[str], max_chars: int) -> str:
+    def _related_chunk_context(self, doc_id: int, terms: list[str], task: str, max_chars: int) -> str:
         try:
             with self.store.connect() as conn:
                 rows = conn.execute(
@@ -367,6 +602,8 @@ class Answerer:
             term_score = sum(2 for term in terms if term and term in haystack)
             score = term_score
             chunk_kind = str(row["chunk_kind"] or "")
+            if self._chunk_matches_task(haystack, task):
+                score += 5
             if chunk_kind == "title":
                 score += 1
             if chunk_kind == "attachment_list" and term_score:
@@ -391,7 +628,7 @@ class Answerer:
                 f"第{row['page']}页" if row["page"] else "",
             ]
             label = " / ".join(part for part in label_parts if part)
-            chunk = f"[{label}] {self._clean(text, max_chars=900)}"
+            chunk = f"[{label}] {self._clean(text, max_chars=320)}"
             scored.append((score, type_priority, -position, chunk))
         scored.sort(reverse=True)
         selected: list[str] = []
@@ -400,7 +637,7 @@ class Answerer:
         attachment_text_count = 0
         for _, _, _, chunk in scored:
             if chunk.startswith("[attachment_text"):
-                if attachment_text_count >= 2:
+                if attachment_text_count >= (3 if task == "material" else 1):
                     continue
                 attachment_text_count += 1
             key = self._normalize_quote_text(chunk[:120])
@@ -411,7 +648,7 @@ class Answerer:
                 break
             selected.append(chunk)
             total += len(chunk)
-            if len(selected) >= 8:
+            if len(selected) >= 5:
                 break
         return "\n".join(selected)
 
@@ -451,7 +688,7 @@ class Answerer:
                 break
             selected.append(line)
             total += len(line)
-            if len(selected) >= 4:
+            if len(selected) >= 3:
                 break
         return "\n".join(selected)[:max_chars]
 
@@ -468,6 +705,7 @@ class Answerer:
         plan: QueryPlan,
         hit: SearchHit,
         *,
+        task: str,
         matched_block: str,
         focused_body_block: str,
         related_chunks_block: str,
@@ -476,6 +714,16 @@ class Answerer:
         snippet_block: str,
     ) -> list[str]:
         """Order evidence by the user's requested answer shape."""
+        if task == "deadline":
+            return [matched_block, focused_body_block, related_chunks_block, snippet_block, attachment_block, body_intro_block]
+        if task == "eligibility":
+            return [focused_body_block, related_chunks_block, matched_block, attachment_block, snippet_block, body_intro_block]
+        if task == "process":
+            return [focused_body_block, related_chunks_block, matched_block, snippet_block, attachment_block, body_intro_block]
+        if task == "material":
+            return [attachment_block, matched_block, related_chunks_block, focused_body_block, snippet_block, body_intro_block]
+        if task == "comparison":
+            return [matched_block, focused_body_block, related_chunks_block, attachment_block, snippet_block, body_intro_block]
         if self._attachment_context_first(plan):
             if hit.attachment_name:
                 return [
@@ -568,6 +816,30 @@ class Answerer:
         return terms
 
     @staticmethod
+    def _task_context_terms(task: str) -> list[str]:
+        aliases = {
+            "deadline": ["报名时间", "申请时间", "截止", "起止", "时间为", "日期", "办理时间", "已截止"],
+            "eligibility": ["对象", "范围", "条件", "要求", "资格", "限制", "不得", "不允许", "学院", "年级"],
+            "process": ["流程", "步骤", "入口", "系统", "平台", "提交", "登录", "办理", "信息门户"],
+            "material": ["附件", "材料", "申请表", "表格", "下载", "证明", "名单", "PDF", "doc", "xls"],
+            "comparison": ["不同", "区别", "差异", "相比", "教务处", "学院"],
+            "general": ["结论", "说明", "要求", "时间", "来源"],
+        }
+        return aliases.get(task, aliases["general"])
+
+    @staticmethod
+    def _chunk_matches_task(text: str, task: str) -> bool:
+        patterns = {
+            "deadline": r"(报名时间|申请时间|截止|起止|时间为|日期|办理时间|已截止)",
+            "eligibility": r"(对象|范围|条件|要求|资格|限制|不得|不允许|学院|年级)",
+            "process": r"(流程|步骤|入口|系统|平台|提交|登录|办理|信息门户)",
+            "material": r"(附件|材料|申请表|表格|下载|证明|名单|PDF|pdf|doc|xls)",
+            "comparison": r"(不同|区别|差异|相比|教务处|学院)",
+        }
+        pattern = patterns.get(task)
+        return bool(pattern and re.search(pattern, text, flags=re.IGNORECASE))
+
+    @staticmethod
     def _usable_terms(values: list[str]) -> list[str]:
         terms: list[str] = []
         seen: set[str] = set()
@@ -588,11 +860,41 @@ class Answerer:
             public.pop("ai_metadata_hint", None)
         return public
 
-    @staticmethod
-    def _public_fact(fact: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in fact.items() if not key.startswith("_")}
+    def _answer_from_reader_payload(
+        self,
+        payload: dict[str, Any],
+        facts: list[dict[str, Any]],
+        sources: list[dict[str, Any]],
+    ) -> str | None:
+        answer = self._clean_multiline(str(payload.get("final_answer") or ""), max_chars=5000)
+        if not answer:
+            return None
+        answer = self._ensure_answer_references(answer, facts)
+        if not re.search(r"参考信息源", answer):
+            lines = [answer.rstrip(), "", "参考信息源："]
+            for source in self._used_sources(facts, sources):
+                date_part = f"，{source.get('publish_date')}" if source.get("publish_date") else ""
+                lines.append(f"{source['ref']} {source.get('source')}：《{source.get('title')}》{date_part}，{source.get('url')}")
+            answer = "\n".join(lines)
+        return answer
 
-    def _validate_fact_cards(
+    @staticmethod
+    def _ensure_answer_references(answer: str, facts: list[dict[str, Any]]) -> str:
+        if re.search(r"\[\d+\]", answer):
+            return answer
+        refs = []
+        for fact in facts:
+            ref = str(fact.get("source_ref") or "").strip()
+            if ref and ref not in refs:
+                refs.append(ref)
+        if not refs:
+            return answer
+        lines = answer.splitlines()
+        if lines:
+            lines[0] = f"{lines[0].rstrip()} {' '.join(refs[:2])}"
+        return "\n".join(lines)
+
+    def _normalize_fact_cards(
         self,
         payload: dict[str, Any],
         sources: list[dict[str, Any]],
@@ -617,9 +919,11 @@ class Answerer:
             fact_confidence = self._normalize_fact_confidence(raw.get("confidence"))
             if slot not in FACT_ALLOWED_SLOTS:
                 slot = "other"
-            if not source or not claim or not quote or not self._quote_supported_by_source(quote, source):
+            if not source or not claim:
                 rejected += 1
                 continue
+            if not quote:
+                quote = self._fallback_fact_quote(claim, source)
             evidence_type = self._verified_evidence_type(raw.get("evidence_type"), source, quote)
             key = (slot, ref, self._normalize_quote_text(quote))
             if key in seen:
@@ -650,18 +954,28 @@ class Answerer:
         )
         return validated, rejected
 
-    def _quote_supported_by_source(self, quote: str, source: dict[str, Any]) -> bool:
-        quote_norm = self._normalize_quote_text(quote)
-        if len(quote_norm) < 4:
-            return False
-        support_norm = self._normalize_quote_text(str(source.get("_support_text") or ""))
-        if quote_norm in support_norm:
-            return True
-        if len(quote_norm) < 18:
-            return False
-        chunks = [quote_norm[index : index + 12] for index in range(0, max(1, len(quote_norm) - 11), 12)]
-        matched = sum(1 for chunk in chunks if chunk and chunk in support_norm)
-        return matched >= max(1, len(chunks) - 1)
+    def _validate_fact_cards(
+        self,
+        payload: dict[str, Any],
+        sources: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int]:
+        return self._normalize_fact_cards(payload, sources)
+
+    def _fallback_fact_quote(self, claim: str, source: dict[str, Any]) -> str:
+        for value in (
+            source.get("snippet"),
+            source.get("title"),
+            source.get("publish_date"),
+            source.get("context"),
+        ):
+            text = self._clean(str(value or ""), max_chars=220)
+            if text:
+                return text
+        for item in source.get("attachments") or []:
+            text = self._clean(" ".join(str(item.get(key) or "") for key in ("name", "url")), max_chars=220)
+            if text:
+                return text
+        return self._clean(claim, max_chars=220)
 
     def _render_fact_card_answer(
         self,
@@ -785,7 +1099,7 @@ class Answerer:
             return "none"
         if not any(fact.get("is_direct") or fact["slot"] == "answer" for fact in facts):
             confidence = "low"
-        if rejected_count >= len(facts):
+        if rejected_count >= len(facts) * 2:
             confidence = "low"
         if any("不足" in warning or "未找到" in warning or "不匹配" in warning for warning in warnings):
             confidence = "low" if confidence != "none" else "none"
@@ -799,7 +1113,7 @@ class Answerer:
     def _fact_warnings(self, payload: dict[str, Any], rejected_count: int, warnings: list[str]) -> list[str]:
         values = [*warnings, *[str(item) for item in payload.get("warnings", []) if str(item).strip()]]
         if rejected_count:
-            values.append(f"AI 抽取的 {rejected_count} 条事实因缺少可核对原文或来源编号不合法，已被丢弃。")
+            values.append(f"AI 返回的 {rejected_count} 条事实因来源编号缺失或内容为空未展示。")
         return self._dedupe_strings(values)
 
     @staticmethod
@@ -935,34 +1249,27 @@ class Answerer:
             warnings=warnings,
         )
 
-    def _extractive_answer(
+    def _ai_unavailable_answer(
         self,
         hits: list[SearchHit],
-        evidence: list[EvidenceItem],
         warnings: list[str],
+        reason: str,
     ) -> AnswerResult:
-        first = hits[0]
         lines = [
-            f"**结论：已找到可能相关的官网来源，最相关来源是《{first.title}》，但当前 AI 摘要不可用，不能生成确定性判断。**",
+            f"**结论：{reason}**",
             "",
-            "候选来源：",
+            "已停止生成总结，避免用规则或片段拼接出误导性答案。",
         ]
-        for index, hit in enumerate(hits[:5], start=1):
-            snippet = self._clean(hit.snippet)
-            date_part = f"（{hit.publish_date}）" if hit.publish_date else ""
-            lines.append(f"- [{index}] 《{hit.title}》{date_part}：{snippet}")
-        lines.append("")
-        lines.append("参考信息源：")
-        for index, hit in enumerate(hits[:5], start=1):
-            date_part = f"，{hit.publish_date}" if hit.publish_date else ""
-            lines.append(f"[{index}] {hit.source}：《{hit.title}》{date_part}，{hit.url}")
+        if warnings:
+            lines.append("")
+            lines.append("提示：" + "；".join(warnings[:3]))
         return AnswerResult(
             answer="\n".join(lines),
-            confidence="low",
-            sources=hits[:5],
-            evidence_notes=[self._clean(hit.snippet) for hit in hits[:3]],
-            evidence=evidence,
-            warnings=warnings,
+            confidence="none",
+            sources=[],
+            evidence_notes=[],
+            evidence=[],
+            warnings=[reason, *warnings],
         )
 
     def _finalize_answer(self, result: AnswerResult, hits: list[SearchHit]) -> AnswerResult:
@@ -1033,6 +1340,15 @@ class Answerer:
         text = re.sub(r"<[^>]+>", "", text or "")
         text = re.sub(r"\s+", " ", text).strip()
         return text[:max_chars]
+
+    @staticmethod
+    def _clean_multiline(text: str, max_chars: int = 5000) -> str:
+        text = re.sub(r"<[^>]+>", "", text or "")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+        cleaned = "\n".join(lines)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned[:max_chars]
 
     @staticmethod
     def _short_quote(quote: str, max_chars: int = 96) -> str:

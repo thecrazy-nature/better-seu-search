@@ -5,6 +5,10 @@ from openai import OpenAI
 from ..config import settings
 
 
+class AIUnavailableError(RuntimeError):
+    """Raised when an AI-required runtime path cannot call the AI service."""
+
+
 def make_ai_client() -> OpenAI | None:
     if not settings.ai_api_key:
         return None

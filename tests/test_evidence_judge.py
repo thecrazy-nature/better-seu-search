@@ -19,7 +19,7 @@ def _hit(doc_id: int, title: str, score: float) -> SearchHit:
 
 
 class EvidenceJudgeTest(unittest.TestCase):
-    def test_apply_judgments_reports_accepted_and_rejected_candidates(self) -> None:
+    def test_apply_judgments_soft_reranks_without_hard_filtering(self) -> None:
         judge = AIEvidenceJudge()
         hits = [
             _hit(1, "关于毕业审核工作的通知", 5.0),
@@ -57,11 +57,11 @@ class EvidenceJudgeTest(unittest.TestCase):
         judged_hits, report = judge._apply_judgments(hits, result, limit=5)
 
         self.assertEqual(report.status, "used")
-        self.assertEqual(report.accepted_count, 2)
-        self.assertEqual(report.rejected_count, 1)
-        self.assertEqual(report.rejected[0]["title"], "关于毕业设计竞赛获奖名单的公示")
-        self.assertEqual([hit.id for hit in judged_hits], [1, 3])
+        self.assertEqual(report.accepted_count, 3)
+        self.assertEqual(report.rejected_count, 0)
+        self.assertEqual([hit.id for hit in judged_hits], [1, 3, 2])
         self.assertEqual(judged_hits[0].evidence_judge_label, "direct_answer")
+        self.assertEqual(judged_hits[-1].evidence_judge_label, "wrong_topic")
         self.assertIn("可回答：source、time", judged_hits[0].relevance_note or "")
         self.assertIn("标题和正文事项均为毕业审核", judged_hits[0].relevance_note or "")
 

@@ -350,7 +350,7 @@ def render_report(metrics: dict[str, Any]) -> str:
             "- `publish_date` 只看数据库字段，不从正文活动时间推断。",
             "- URL 年份一致性只检查 `.../YYYY/MMDD/...` 这类官网常见路径。",
             "- “正文过短”不必然错误，但容易导致 AI 总结时上下文不足。",
-            "- 当前 `hash` embedding 只能做粗略语义补充，不能等同 BGE/OpenAI 等真实 embedding。",
+            f"- 当前 embedding provider：`{metrics['embedding_provider']}`；BGE/API 适合语义召回，`hash` 只适合作离线兜底。",
         ]
     )
     return "\n".join(lines) + "\n"

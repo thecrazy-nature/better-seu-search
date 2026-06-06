@@ -16,10 +16,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from ..ai.client import AIUnavailableError
 from ..ai.answerer import Answerer
 from ..ai.evidence_judge import AIEvidenceJudge
 from ..ai.evidence_judge import EvidenceJudgeReport
 from ..ai.planner import QueryPlanner
+from ..ai.reranker import AIReranker
 from ..config import ROOT_DIR
 from ..config import settings
 from ..crawl import run_crawl
@@ -69,6 +71,7 @@ planner = QueryPlanner()
 engine = SearchEngine(store)
 answerer = Answerer()
 evidence_judge = AIEvidenceJudge()
+reranker = AIReranker()
 SEARCH_CACHE_MAX = 128
 search_cache: OrderedDict[str, SearchResponse] = OrderedDict()
 crawl_tasks: dict[str, dict] = {}
@@ -190,16 +193,36 @@ def search(payload: SearchRequest) -> SearchResponse:
         search_cache.move_to_end(cache_key)
         return cached.model_copy(deep=True)
     response = _run_search(payload)
-    search_cache[cache_key] = response.model_copy(deep=True)
-    if len(search_cache) > SEARCH_CACHE_MAX:
-        search_cache.popitem(last=False)
+    if not _is_ai_unavailable_response(response):
+        search_cache[cache_key] = response.model_copy(deep=True)
+        if len(search_cache) > SEARCH_CACHE_MAX:
+            search_cache.popitem(last=False)
     return response
 
 
 def _run_search(payload: SearchRequest) -> SearchResponse:
     session_id = payload.session_id or uuid.uuid4().hex
     effective_query = _contextualize_query(payload.query, session_id)
-    plan = planner.plan(effective_query, payload.profile)
+    try:
+        plan = planner.plan(effective_query, payload.profile)
+    except AIUnavailableError as exc:
+        plan = QueryPlan(
+            intent="unknown",
+            confidence=0.0,
+            normalized_query=effective_query,
+            sub_questions=[],
+            retrieval_keywords=[],
+            expanded_queries=[],
+            entities={},
+            filters={},
+            need_answer_summary=False,
+            output_preset="no_answer",
+            notes=str(exc),
+        )
+        answer = _ai_unavailable_answer(str(exc))
+        response = SearchResponse(query_plan=plan, hits=[], answer=answer, evidence_judge=None, session_id=session_id)
+        _remember_session(session_id, payload.query, plan, payload.profile)
+        return response
     if plan.intent == "unknown":
         answer = AnswerResult(
             answer=(
@@ -216,14 +239,56 @@ def _run_search(payload: SearchRequest) -> SearchResponse:
         _remember_session(session_id, payload.query, plan, payload.profile)
         return response
     candidates = engine.search(plan, payload.profile, max(payload.limit * 3, 24))
-    hits, judge_report = evidence_judge.judge(payload.query, plan, candidates, payload.profile, payload.limit)
-    hits = hits[: payload.limit]
-    if judge_report.notes:
-        plan.notes = f"{plan.notes or ''} AI evidence judge: {judge_report.notes}".strip()
-    answer = answerer.answer(payload.query, plan, hits)
+    try:
+        candidates, reranker_report = reranker.rerank(effective_query, plan, candidates, payload.profile)
+        if reranker_report.notes:
+            plan.notes = f"{plan.notes or ''} AI reranker: {reranker_report.notes}".strip()
+        if settings.ai_evidence_judge_mode in {"off", "false", "0", "disabled"}:
+            hits = candidates[: payload.limit]
+            judge_report = EvidenceJudgeReport(
+                status="skipped",
+                notes="Evidence Judge 已关闭：本地检索结果直接交给 Fact Reader 总结。",
+                candidate_count=min(len(candidates), payload.limit),
+            )
+        else:
+            hits, judge_report = evidence_judge.judge(payload.query, plan, candidates, payload.profile, payload.limit)
+        hits = hits[: payload.limit]
+        if judge_report.notes:
+            plan.notes = f"{plan.notes or ''} AI evidence judge: {judge_report.notes}".strip()
+        answer = answerer.answer(payload.query, plan, hits)
+    except AIUnavailableError as exc:
+        plan.notes = f"{plan.notes or ''} {exc}".strip()
+        response = SearchResponse(
+            query_plan=plan,
+            hits=[],
+            answer=_ai_unavailable_answer(str(exc)),
+            evidence_judge=None,
+            session_id=session_id,
+        )
+        _remember_session(session_id, payload.query, plan, payload.profile)
+        return response
     response = SearchResponse(query_plan=plan, hits=hits, answer=answer, evidence_judge=judge_report, session_id=session_id)
     _remember_session(session_id, payload.query, plan, payload.profile)
     return response
+
+
+def _ai_unavailable_answer(reason: str) -> AnswerResult:
+    return AnswerResult(
+        answer=(
+            f"**结论：AI 当前不可用，无法理解问题或生成检索计划。**\n\n"
+            f"{reason}\n\n"
+            "系统已停止继续检索和总结，避免用规则兜底生成不可靠结果。"
+        ),
+        confidence="none",
+        sources=[],
+        evidence_notes=[],
+        evidence=[],
+        warnings=[reason],
+    )
+
+
+def _is_ai_unavailable_response(response: SearchResponse) -> bool:
+    return any("AI" in warning and "不可用" in warning for warning in response.answer.warnings)
 
 
 def _contextualize_query(query: str, session_id: str) -> str:
