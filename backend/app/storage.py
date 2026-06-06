@@ -9,16 +9,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import settings
-from .embeddings import (
-    embed_text,
-    embed_texts,
-    embedding_json_matches_current,
-    embedding_to_json,
-)
+from .embeddings import embed_texts, embedding_json_matches_current, embedding_to_json
 from .content_cleaning import clean_body_text
 from .models import SourceDocument
 from .preprocess import DOMAIN_TERMS, enrich_document
-from .attachments import attachment_text_parts
+from .attachments import attachment_table_row_parts, attachment_text_parts
 from .search.synonyms import SYNONYMS
 
 CHUNK_TARGET_CHARS = 900
@@ -178,7 +173,10 @@ def _build_chunk_tags(row: sqlite3.Row, chunk: dict[str, object], chunk_text: st
         values.append(str(row["publish_date"])[:4])
     values.extend(_important_title_terms(title))
     values.extend(_important_title_terms(heading))
-    if chunk_kind == "attachment_text":
+    if chunk_kind == "attachment_table_row":
+        values.extend(["附件表格行", "表格行", "行级证据", "表格", "名单", "条件", "要求"])
+        values.extend(str(chunk.get(key) or "") for key in ("sheet", "table", "row_number"))
+    elif chunk_kind == "attachment_text":
         values.extend(["附件正文", "附件内容", "表格", "名单", "下载"])
     elif chunk_kind == "attachment_list":
         values.extend(["附件列表", "下载", "材料"])
@@ -275,6 +273,8 @@ def split_document_chunks(title: str, body: str, attachments: list[dict[str, Any
     if attachment_names:
         parts.append({"text": f"附件：{attachment_names}", "heading": "附件", "page": None, "chunk_kind": "attachment_list"})
     for attachment in attachments or []:
+        for part in attachment_table_row_parts(attachment):
+            parts.append({**part, "chunk_kind": "attachment_table_row"})
         for part in attachment_text_parts(attachment):
             parts.append({**part, "chunk_kind": "attachment_text"})
     return [
@@ -319,77 +319,6 @@ class DocumentStore:
                     content_hash TEXT,
                     crawled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
-
-                CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-                    title,
-                    body,
-                    source,
-                    category,
-                    attachments,
-                    topics,
-                    content='documents',
-                    content_rowid='id',
-                    tokenize='unicode61'
-                );
-
-                CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-                    INSERT INTO documents_fts(
-                        rowid, title, body, source, category, attachments, topics
-                    )
-                    VALUES (
-                        new.id,
-                        new.title,
-                        new.body,
-                        new.source,
-                        COALESCE(new.category, ''),
-                        COALESCE(new.attachments_json, ''),
-                        COALESCE(new.topics_json, '')
-                    );
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-                    INSERT INTO documents_fts(
-                        documents_fts, rowid, title, body, source, category, attachments, topics
-                    )
-                    VALUES (
-                        'delete',
-                        old.id,
-                        old.title,
-                        old.body,
-                        old.source,
-                        COALESCE(old.category, ''),
-                        COALESCE(old.attachments_json, ''),
-                        COALESCE(old.topics_json, '')
-                    );
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
-                    INSERT INTO documents_fts(
-                        documents_fts, rowid, title, body, source, category, attachments, topics
-                    )
-                    VALUES (
-                        'delete',
-                        old.id,
-                        old.title,
-                        old.body,
-                        old.source,
-                        COALESCE(old.category, ''),
-                        COALESCE(old.attachments_json, ''),
-                        COALESCE(old.topics_json, '')
-                    );
-                    INSERT INTO documents_fts(
-                        rowid, title, body, source, category, attachments, topics
-                    )
-                    VALUES (
-                        new.id,
-                        new.title,
-                        new.body,
-                        new.source,
-                        COALESCE(new.category, ''),
-                        COALESCE(new.attachments_json, ''),
-                        COALESCE(new.topics_json, '')
-                    );
-                END;
 
                 CREATE TABLE IF NOT EXISTS document_chunks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -460,13 +389,14 @@ class DocumentStore:
                     error TEXT,
                     traceback TEXT
                 );
+
                 """
             )
             self._ensure_document_columns(conn)
+            self._drop_legacy_document_fts_objects(conn)
             self._ensure_chunk_columns(conn)
             self._ensure_chunk_fts_schema(conn)
             self._ensure_source_profiles(conn)
-            self._ensure_chunks(conn)
 
     @staticmethod
     def _ensure_document_columns(conn: sqlite3.Connection) -> None:
@@ -493,6 +423,17 @@ class DocumentStore:
         for column, sql in additions.items():
             if column not in columns:
                 conn.execute(sql)
+
+    @staticmethod
+    def _drop_legacy_document_fts_objects(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS documents_ai;
+            DROP TRIGGER IF EXISTS documents_ad;
+            DROP TRIGGER IF EXISTS documents_au;
+            DROP TABLE IF EXISTS documents_fts;
+            """
+        )
 
     @staticmethod
     def _ensure_chunk_fts_schema(conn: sqlite3.Connection) -> None:
@@ -589,33 +530,6 @@ class DocumentStore:
                 (source, source_type, weight),
             )
 
-    def _ensure_chunks(self, conn: sqlite3.Connection) -> None:
-        chunk_count = int(conn.execute("SELECT COUNT(*) AS n FROM document_chunks").fetchone()["n"])
-        zero_tokens = int(
-            conn.execute("SELECT COUNT(*) AS n FROM document_chunks WHERE token_count = 0").fetchone()["n"]
-        )
-        empty_search_text = int(
-            conn.execute("SELECT COUNT(*) AS n FROM document_chunks WHERE search_text = ''").fetchone()["n"]
-        )
-        empty_topics = int(
-            conn.execute("SELECT COUNT(*) AS n FROM document_chunks WHERE topics = '' AND topics_json != '[]'").fetchone()["n"]
-        )
-        document_count = int(conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"])
-        docs_with_title_chunks = int(
-            conn.execute(
-                "SELECT COUNT(DISTINCT document_id) AS n FROM document_chunks WHERE chunk_kind = 'title'"
-            ).fetchone()["n"]
-        )
-        if (
-            chunk_count > 0
-            and zero_tokens == 0
-            and empty_search_text == 0
-            and empty_topics == 0
-            and docs_with_title_chunks >= document_count
-        ):
-            return
-        self.rebuild_all_chunks(conn)
-
     def rebuild_all_chunks(self, conn: sqlite3.Connection | None = None) -> int:
         if conn is not None:
             docs = conn.execute("SELECT * FROM documents").fetchall()
@@ -623,7 +537,7 @@ class DocumentStore:
             conn.execute("DELETE FROM document_chunks")
             self._create_chunk_fts_objects(conn)
             for doc in docs:
-                self._insert_chunks(conn, doc["id"], doc)
+                self._insert_chunks(conn, doc["id"], doc, embed_immediately=False)
             return len(docs)
         with self.connect() as owned_conn:
             return self.rebuild_all_chunks(owned_conn)
@@ -692,12 +606,37 @@ class DocumentStore:
         conn.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
         self._insert_chunks(conn, document_id, row)
 
-    def _insert_chunks(self, conn: sqlite3.Connection, document_id: int, row: sqlite3.Row) -> None:
+    def _insert_chunks(
+        self,
+        conn: sqlite3.Connection,
+        document_id: int,
+        row: sqlite3.Row,
+        *,
+        embed_immediately: bool = True,
+    ) -> None:
         attachments = _json_load_list(row["attachments_json"])
         chunks = split_document_chunks(row["title"], row["body"], attachments)
+        records: list[dict[str, Any]] = []
+        embedding_texts: list[str] = []
         for index, chunk in enumerate(chunks):
             chunk_text = str(chunk.get("text") or "")
             chunk_tags = _build_chunk_tags(row, chunk, chunk_text)
+            records.append(
+                {
+                    "index": index,
+                    "chunk": chunk,
+                    "chunk_text": chunk_text,
+                    "chunk_tags": chunk_tags,
+                    "search_text": _build_chunk_search_text(row, chunk, chunk_text),
+                    "token_count": _estimate_token_count(chunk_text),
+                }
+            )
+            embedding_texts.append(_build_chunk_embedding_text(row, chunk, chunk_text, chunk_tags))
+        embeddings = embed_texts(embedding_texts) if embed_immediately and embedding_texts else []
+        if not embeddings:
+            embeddings = [[] for _ in records]
+        for record, embedding in zip(records, embeddings):
+            chunk = record["chunk"]
             conn.execute(
                 """
                 INSERT INTO document_chunks (
@@ -710,22 +649,22 @@ class DocumentStore:
                 """,
                 (
                     document_id,
-                    index,
+                    record["index"],
                     row["title"],
-                    chunk_text,
-                    _build_chunk_search_text(row, chunk, chunk_text),
+                    record["chunk_text"],
+                    record["search_text"],
                     row["source"],
                     row["publish_date"],
                     chunk.get("heading"),
                     chunk.get("page"),
                     chunk.get("attachment_name"),
                     chunk.get("chunk_kind") or "body",
-                    _estimate_token_count(chunk_text),
+                    record["token_count"],
                     row["topics_json"],
                     " ".join(str(item) for item in _json_load_list(row["topics_json"])),
                     row["keywords_json"],
-                    _json_dump(chunk_tags),
-                    embedding_to_json(embed_text(_build_chunk_embedding_text(row, chunk, chunk_text, chunk_tags))),
+                    _json_dump(record["chunk_tags"]),
+                    embedding_to_json(embedding) if embedding else None,
                 ),
             )
 
@@ -741,6 +680,11 @@ class DocumentStore:
             attachment_text_chunks = int(
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM document_chunks WHERE chunk_kind = 'attachment_text'"
+                ).fetchone()["n"]
+            )
+            attachment_table_row_chunks = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM document_chunks WHERE chunk_kind = 'attachment_table_row'"
                 ).fetchone()["n"]
             )
             rows = conn.execute(
@@ -761,6 +705,7 @@ class DocumentStore:
             "attachments_with_pages": sum(1 for item in attachments if item.get("pages")),
             "attachments_with_sheets": sum(1 for item in attachments if item.get("sheets")),
             "attachment_text_chunks": attachment_text_chunks,
+            "attachment_table_row_chunks": attachment_table_row_chunks,
         }
 
     def get_source_profiles(self) -> dict[str, dict]:

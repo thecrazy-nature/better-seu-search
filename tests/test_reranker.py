@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock
 
+from backend.app.config import settings
 from backend.app.ai.reranker import AIReranker, RerankItem, RerankResult
-from backend.app.models import SearchHit
+from backend.app.models import QueryPlan, SearchHit
 
 
 def _hit(doc_id: int, title: str, score: float) -> SearchHit:
@@ -48,6 +50,42 @@ class RerankerTest(unittest.TestCase):
         self.assertEqual([hit.id for hit in ranked], [2, 3, 1])
         self.assertIn("AI重排：strong", ranked[0].relevance_note or "")
         self.assertIn("毕业班学分核对", ranked[0].relevance_note or "")
+
+    def test_parse_json_fenced_payload(self) -> None:
+        payload = """```json
+        {"ranked":[{"id":2,"score":0.9,"label":"strong","reason":"直接匹配"}]}
+        ```"""
+
+        result = AIReranker._result_from_payload(AIReranker._parse_json_object(payload))
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.ranked[0].id, 2)  # type: ignore[union-attr]
+        self.assertEqual(result.ranked[0].label, "strong")  # type: ignore[union-attr]
+
+    def test_score_only_payload_is_accepted(self) -> None:
+        result = AIReranker._result_from_payload(
+            {"scores": [{"id": 1, "score": 0.91}, {"id": 2, "score": 0.2}]}
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.ranked[0].label, "strong")  # type: ignore[union-attr]
+        self.assertEqual(result.ranked[1].label, "wrong_topic")  # type: ignore[union-attr]
+
+    def test_rerank_failure_keeps_local_order(self) -> None:
+        old_mode = settings.ai_reranker_mode
+        settings.ai_reranker_mode = "auto"
+        reranker = AIReranker()
+        reranker.client = Mock()
+        reranker._rerank_with_ai = Mock(return_value=None)  # type: ignore[method-assign]
+        hits = [_hit(1, "A", 2.0), _hit(2, "B", 1.0)]
+        try:
+            ranked, report = reranker.rerank("测试", QueryPlan(normalized_query="测试"), hits)
+        finally:
+            settings.ai_reranker_mode = old_mode
+
+        self.assertEqual([hit.id for hit in ranked], [1, 2])
+        self.assertEqual(report.status, "failed")
+        self.assertTrue(report.warnings)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..models import QueryPlan, SearchHit, UserProfile
-from .client import AIUnavailableError, make_ai_client
+from .client import make_ai_client
 
 
 RerankLabel = Literal["strong", "partial", "weak", "wrong_topic", "stale"]
@@ -91,16 +91,23 @@ class AIReranker:
         if not hits:
             return hits, RerankerReport(status="skipped", notes="没有候选来源。", candidate_count=0)
         if not self.client:
-            if self._should_rerank(plan):
-                raise AIUnavailableError("AI Reranker 不可用：未配置 API Key 或 AI 客户端初始化失败。")
-            return hits, RerankerReport(status="skipped", notes="当前查询跳过 AI 重排。", candidate_count=candidate_count)
+            status: RerankStatus = "failed" if self._should_rerank(plan) else "skipped"
+            notes = "AI Reranker 不可用，已保留本地排序。" if status == "failed" else "当前查询跳过 AI 重排。"
+            warnings = ["未配置 API Key 或 AI 客户端初始化失败。"] if status == "failed" else []
+            return hits, RerankerReport(status=status, notes=notes, candidate_count=candidate_count, warnings=warnings)
         if len(hits) < 2 or not self._should_rerank(plan):
             return hits, RerankerReport(status="skipped", notes="当前查询跳过 AI 重排。", candidate_count=candidate_count)
 
         result = self._rerank_with_ai(user_query, plan, hits, profile)
         if not result or not result.ranked:
-            raise AIUnavailableError("AI Reranker 调用失败或返回内容不可解析。")
-        return self._apply_rankings(hits, result)
+            return hits, RerankerReport(
+                status="failed",
+                notes="AI Reranker 未返回可用评分，已保留本地排序。",
+                candidate_count=candidate_count,
+                warnings=["AI Reranker 调用失败或返回内容不可解析。"],
+            )
+        ranked, report = self._apply_rankings(hits, result)
+        return ranked, report
 
     @staticmethod
     def _should_rerank(plan: QueryPlan) -> bool:
@@ -144,7 +151,8 @@ class AIReranker:
                     },
                 ],
             )
-            return RerankResult(**json.loads(response.choices[0].message.content or "{}"))
+            data = self._parse_json_object(response.choices[0].message.content or "")
+            return self._result_from_payload(data)
         except Exception:
             return None
 
@@ -186,6 +194,76 @@ class AIReranker:
             ranked_count=len(used),
             warnings=[],
         )
+
+    @staticmethod
+    def _parse_json_object(content: str) -> dict[str, Any] | None:
+        text = (content or "").strip()
+        if not text:
+            return None
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+        if fenced:
+            text = fenced.group(1).strip()
+        elif "{" in text and "}" in text:
+            text = text[text.find("{") : text.rfind("}") + 1]
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    @classmethod
+    def _result_from_payload(cls, data: dict[str, Any] | None) -> RerankResult | None:
+        if not data:
+            return None
+        raw_items = data.get("ranked") or data.get("scores") or data.get("candidates") or []
+        if not isinstance(raw_items, list):
+            return None
+        items: list[RerankItem] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                doc_id = int(raw.get("id"))
+            except (TypeError, ValueError):
+                continue
+            score = cls._normalize_score(raw.get("score"))
+            label = str(raw.get("label") or raw.get("verdict") or "").strip().lower()
+            if label not in cls.LABEL_PRIORITY:
+                label = cls._label_from_score(score)
+            slots_raw = raw.get("answerable_slots") or raw.get("slots") or []
+            slots = [str(item) for item in slots_raw if item] if isinstance(slots_raw, list) else []
+            items.append(
+                RerankItem(
+                    id=doc_id,
+                    label=label,  # type: ignore[arg-type]
+                    score=score,
+                    reason=str(raw.get("reason") or raw.get("rationale") or ""),
+                    answerable_slots=slots,
+                )
+            )
+        if not items:
+            return None
+        return RerankResult(ranked=items, notes=str(data.get("notes") or data.get("reason") or ""))
+
+    @staticmethod
+    def _normalize_score(value: object) -> float:
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if score > 1 and score <= 100:
+            score = score / 100
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _label_from_score(score: float) -> RerankLabel:
+        if score >= 0.82:
+            return "strong"
+        if score >= 0.55:
+            return "partial"
+        if score >= 0.25:
+            return "weak"
+        return "wrong_topic"
 
     @staticmethod
     def _candidate_payload(hit: SearchHit) -> dict[str, Any]:

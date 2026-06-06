@@ -35,9 +35,9 @@ class Settings:
         self.ai_timeout_seconds = float(os.getenv("AI_TIMEOUT_SECONDS", "15"))
         self.ai_max_retries = int(os.getenv("AI_MAX_RETRIES", "0"))
         self.ai_planner_mode = os.getenv("AI_PLANNER_MODE", "always").strip().lower()
-        self.ai_reranker_mode = os.getenv("AI_RERANKER_MODE", "auto").strip().lower()
+        self.ai_reranker_mode = os.getenv("AI_RERANKER_MODE", "off").strip().lower()
         self.ai_evidence_judge_mode = os.getenv("AI_EVIDENCE_JUDGE_MODE", "off").strip().lower()
-        self.ai_answer_composer_mode = os.getenv("AI_ANSWER_COMPOSER_MODE", "always").strip().lower()
+        self.ai_answer_composer_mode = os.getenv("AI_ANSWER_COMPOSER_MODE", "simple").strip().lower()
 
         # Backward-compatible aliases for older code and local scripts.
         self.openai_api_key = self.ai_api_key

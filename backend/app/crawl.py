@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .backfill_calendar_2025_2026 import backfill_calendar
 from .crawler.seu_sites import PublicSiteCrawler
 from .storage import DocumentStore
 
@@ -33,6 +34,8 @@ def run_crawl() -> int:
     duplicate_deleted = store.delete_duplicate_documents()
     if duplicate_deleted:
         print(f"[store] deleted_duplicates={duplicate_deleted}", flush=True)
+    calendar_result = backfill_calendar()
+    print(f"[store] backfilled_calendar={calendar_result}", flush=True)
     crawler.write_report()
     return count
 

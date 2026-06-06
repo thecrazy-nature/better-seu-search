@@ -146,34 +146,6 @@ class SearchEngine:
                     if old is None or score > old[1]:
                         rows_by_id[hit_dict["id"]] = (hit_dict, score)
 
-            for query in query_candidates[:16]:
-                fts = _fts_query(query)
-                if not fts:
-                    continue
-                try:
-                    rows = conn.execute(
-                        """
-                        SELECT d.*,
-                               bm25(documents_fts, 4.0, 1.0, 0.5, 0.5, 0.8, 0.8) AS rank,
-                               snippet(documents_fts, 1, '<mark>', '</mark>', '...', 36) AS snip
-                        FROM documents_fts
-                        JOIN documents d ON d.id = documents_fts.rowid
-                        WHERE documents_fts MATCH ?
-                        ORDER BY rank
-                        LIMIT 40
-                        """,
-                        (fts,),
-                    ).fetchall()
-                except Exception:
-                    rows = []
-                for row in rows:
-                    base_score = max(0.1, -float(row["rank"]))
-                    hit_dict = row_to_hit(row, base_score, row["snip"] or row["body"][:180])
-                    score = self._score(hit_dict, plan, profile, base_score)
-                    old = rows_by_id.get(hit_dict["id"])
-                    if old is None or score > old[1]:
-                        rows_by_id[hit_dict["id"]] = (hit_dict, score)
-
             like_terms = self._like_terms(plan, query_candidates)
             for term in like_terms[:16]:
                 rows = conn.execute(
@@ -283,6 +255,8 @@ class SearchEngine:
         score = similarity * 4.0
         if hit.get("chunk_kind") == "attachment_text":
             score -= 0.35
+        elif hit.get("chunk_kind") == "attachment_table_row":
+            score += 0.15
         if plan.intent == "attachment_query" and hit.get("attachments"):
             score += 0.25
         return max(0.1, score)
@@ -508,6 +482,7 @@ class SearchEngine:
         haystack_without_body = f"{titleish_haystack} {metadata_haystack}"
         haystack_with_body = f"{haystack_without_body} {body_haystack}"
         specific_terms = self._specific_match_terms(plan)
+        coverage_terms = self._coverage_terms(plan)
         if normalized_query and normalized_query in title:
             score += 5.0
         if specific_terms:
@@ -530,6 +505,23 @@ class SearchEngine:
                     score -= 6.0
             elif plan.intent in {"deadline_query", "process_guide", "eligibility_query"} and not (title_hits or body_hits):
                 score -= 1.5
+        if coverage_terms:
+            title_covered = [term for term in coverage_terms if term in titleish_haystack]
+            body_covered = [term for term in coverage_terms if term in body_haystack]
+            metadata_covered = [
+                term
+                for term in coverage_terms
+                if term not in title_covered and term not in body_covered and term in metadata_haystack
+            ]
+            covered_terms = set(title_covered + body_covered + metadata_covered)
+            score += min(4.5, len(title_covered) * 1.3 + len(body_covered) * 0.9 + len(metadata_covered) * 0.35)
+            if len(coverage_terms) >= 2:
+                if len(covered_terms) >= 2:
+                    score += min(3.2, (len(covered_terms) - 1) * 1.1)
+                elif plan.intent in {"answer_question", "process_guide", "deadline_query", "eligibility_query"}:
+                    score -= 1.8
+            if hit.get("chunk_kind") == "attachment_table_row" and len(covered_terms) >= 2:
+                score += 0.8
         for query in self._plan_match_terms(plan, 8):
             if query and query in title:
                 score += 0.6 if self._is_generic_match_term(query) else 2.0
@@ -553,6 +545,8 @@ class SearchEngine:
             elif action in haystack_with_body:
                 score += 0.1 if self._is_generic_match_term(action) else 0.4
 
+        if self._looks_like_contact_hit(hit) and not self._query_wants_contact(plan):
+            score -= 3.0
         if hit["source"] == "教务处":
             score += 0.9
         source_profile = self.source_profiles.get(hit["source"] or "")
@@ -562,6 +556,11 @@ class SearchEngine:
             score += 2.2
         if plan.intent == "attachment_query" and hit["attachments"]:
             score += 2.0
+        if hit.get("chunk_kind") == "attachment_table_row":
+            if specific_terms and any(term in body_haystack for term in specific_terms):
+                score += 1.3
+            if plan.intent in {"eligibility_query", "attachment_query", "answer_question"}:
+                score += 0.4
         if plan.intent == "latest_updates":
             score += _recency_bonus(hit["publish_date"]) * 2
             if re.search(r"(通知|公告|公示|安排|查询)", title):
@@ -631,6 +630,68 @@ class SearchEngine:
         return len(compact) < 2
 
     @staticmethod
+    def _looks_like_contact_hit(hit: dict) -> bool:
+        text = " ".join(
+            [
+                hit.get("title") or "",
+                hit.get("heading") or "",
+                hit.get("attachment_name") or "",
+                hit.get("snippet") or "",
+                hit.get("matched_chunk_text") or "",
+            ]
+        )
+        return bool(re.search(r"(联系电话|联系方式|教务老师|联系人|电话)", text))
+
+    @staticmethod
+    def _query_wants_contact(plan: QueryPlan) -> bool:
+        text = " ".join(
+            [
+                plan.normalized_query,
+                *plan.sub_questions,
+                *plan.retrieval_keywords,
+                *plan.expanded_queries,
+                " ".join(str(item) for item in plan.entities.values() if isinstance(item, str)),
+            ]
+        )
+        return bool(re.search(r"(联系电话|联系方式|联系谁|老师|联系人|电话)", text))
+
+    @staticmethod
+    def _coverage_terms(plan: QueryPlan) -> list[str]:
+        values: list[str] = []
+        values.extend(plan.retrieval_keywords)
+        values.extend(plan.expanded_queries)
+        values.extend(plan.sub_questions)
+        for key in ("topic", "action"):
+            value = plan.entities.get(key)
+            if isinstance(value, str):
+                values.append(value)
+            elif isinstance(value, list):
+                values.extend(str(item) for item in value)
+        for key in ("college", "grade", "student_type"):
+            value = plan.filters.get(key) or plan.entities.get(key)
+            if isinstance(value, str):
+                values.append(value)
+            elif isinstance(value, list):
+                values.extend(str(item) for item in value)
+        if not values:
+            values.extend(TOKEN_RE.findall(plan.normalized_query or ""))
+
+        output: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            compact = re.sub(r"\s+", "", str(value or "")).strip()
+            if SearchEngine._is_generic_match_term(compact):
+                continue
+            if len(compact) > 18 and not re.search(r"[A-Za-z0-9]", compact):
+                continue
+            key = compact.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(compact)
+        return output[:10]
+
+    @staticmethod
     def _time_scope_bonus(hit: dict, plan: QueryPlan) -> float:
         scope = plan.time_scope
         publish_date = hit.get("publish_date")
@@ -682,6 +743,8 @@ class SearchEngine:
             if query and query in body:
                 reasons.append(f"正文片段包含“{query}”")
                 break
+        if hit.get("chunk_kind") == "attachment_table_row":
+            reasons.append("命中附件表格行")
         if plan.intent == "deadline_query":
             if hit.get("deadline"):
                 reasons.append(f"提取到截止日期 {hit['deadline']}")

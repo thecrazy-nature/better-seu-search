@@ -33,6 +33,8 @@ def backfill_attachment_text(
         "attachments": 0,
         "pages": 0,
         "sheets": 0,
+        "tables": 0,
+        "table_rows": 0,
         "skipped_existing": 0,
         "skipped_unsupported": 0,
         "skipped_too_large": 0,
@@ -88,12 +90,18 @@ def backfill_attachment_text(
                     item["text"] = payload["text"]
                     item.pop("pages", None)
                     item.pop("sheets", None)
+                    item.pop("tables", None)
                     if payload.get("pages"):
                         item["pages"] = payload["pages"]
                         stats["pages"] += len(payload["pages"])
                     if payload.get("sheets"):
                         item["sheets"] = payload["sheets"]
                         stats["sheets"] += len(payload["sheets"])
+                        stats["table_rows"] += sum(len(sheet.get("rows") or []) for sheet in payload["sheets"])
+                    if payload.get("tables"):
+                        item["tables"] = payload["tables"]
+                        stats["tables"] += len(payload["tables"])
+                        stats["table_rows"] += sum(len(table.get("rows") or []) for table in payload["tables"])
                     changed = True
                     if should_refresh:
                         stats["refreshed_existing"] += 1
@@ -103,6 +111,7 @@ def backfill_attachment_text(
                         item.pop("text", None)
                         item.pop("pages", None)
                         item.pop("sheets", None)
+                        item.pop("tables", None)
                         changed = True
                         stats["cleared_existing"] += 1
                     stats["parse_empty"] += 1

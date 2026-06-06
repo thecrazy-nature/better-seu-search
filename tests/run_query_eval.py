@@ -239,16 +239,25 @@ def search_locally(query: str, profile_payload: dict[str, Any], limit: int) -> d
             },
         }
     candidates = engine.search(plan, profile, max(limit * 3, 24))
-    candidates, reranker_report = reranker.rerank(query, plan, candidates, profile)
-    if reranker_report.notes:
-        plan.notes = f"{plan.notes or ''} AI reranker: {reranker_report.notes}".strip()
+    if settings.ai_reranker_mode in {"off", "false", "0", "disabled"}:
+        from backend.app.ai.reranker import RerankerReport
+
+        reranker_report = RerankerReport(
+            status="skipped",
+            notes="AI Reranker 已关闭：使用本地 FTS/LIKE/BGE 综合分轻量排序。",
+            candidate_count=min(len(candidates), limit),
+        )
+    else:
+        candidates, reranker_report = reranker.rerank(query, plan, candidates, profile)
+        if reranker_report.notes:
+            plan.notes = f"{plan.notes or ''} AI reranker: {reranker_report.notes}".strip()
     if settings.ai_evidence_judge_mode in {"off", "false", "0", "disabled"}:
         from backend.app.ai.evidence_judge import EvidenceJudgeReport
 
         hits = candidates[:limit]
         judge_report = EvidenceJudgeReport(
             status="skipped",
-            notes="Evidence Judge 已关闭：本地检索结果直接交给 Fact Reader 总结。",
+            notes="Evidence Judge 已关闭：本地排序结果直接交给答案生成器。",
             candidate_count=min(len(candidates), limit),
         )
     else:

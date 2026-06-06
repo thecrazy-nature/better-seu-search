@@ -5,10 +5,10 @@
 1. 同学输入自然语言问题。
 2. AI Query Planner 解析意图、拆 `sub_questions`，生成 `retrieval_keywords`、少量同义查询、学院、年级、身份等结构化字段。
 3. 本地检索用 FTS / LIKE / BGE embedding 并行粗召回候选，尽量提高召回，不在这一层过度替用户下结论。
-4. AI Reranker 对粗召回候选做轻量语义重排，把最像“能回答问题”的来源提前。
-5. AI Answer Composer 阅读重排后的精简证据包生成答案，并列出参考消息源。
+4. 本地排序用 BM25/关键词/BGE 相似度、标题命中、来源权威、发布时间和用户画像做轻量综合排序。
+5. 单次 AI Answer Composer 阅读排序后的精简证据包生成答案，并列出参考消息源。
 6. 硬规则校验会确保 URL 和来源来自数据库，`publish_date` 只使用数据库字段。
-7. Evidence Judge 默认关闭；需要更强证据过滤时可打开。没有配置 AI Key 时，Planner/总结会明确提示 AI 不可用。
+7. AI Reranker 和 Evidence Judge 默认关闭；需要诊断或更强证据过滤时可显式打开。没有配置 AI Key 时，Planner/总结会明确提示 AI 不可用。
 
 ## 功能范围
 
@@ -19,7 +19,7 @@
 - 少量高置信固定别名扩展，主要语义召回交给 AI Planner 和 BGE embedding
 - 学院、年级、学生类型参与排序
 - 找原文 / 问结论 / 查流程 / 查截止时间 / 找附件等意图
-- 可选 AI Evidence Judge 证据裁判，过滤弱相关、跑题和过旧候选
+- 可选 AI Reranker / Evidence Judge，用于诊断或更严格证据过滤
 - 答案硬校验，移除未收录 URL，并只保留真实命中来源
 - AI 总结和参考来源展示
 - 结构化依据片段 `evidence`
@@ -75,9 +75,9 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 配置后：
 
 - 查询规划默认走 AI JSON 解析，由 AI 理解意图、拆子问题、生成检索关键词
-- 检索候选默认先走本地 FTS / LIKE / BGE embedding 粗召回，再由 AI Reranker 做轻量重排
-- 答案默认由 AI Answer Composer 基于重排后的检索来源生成
-- Evidence Judge 默认关闭，可在需要更严格证据筛选时开启
+- 检索候选默认走本地 FTS / LIKE / BGE embedding 粗召回和轻量排序，不再默认调用 AI Reranker
+- 答案默认由单次 AI Answer Composer 基于排序后的检索来源生成
+- AI Reranker 和 Evidence Judge 默认关闭，可在需要诊断排序或更严格证据筛选时开启
 - 仍会保留“不得脱离来源回答”的系统规则
 - 最后的硬规则校验仍会移除未收录 URL，并把来源日期固定为数据库里的 `publish_date`
 
@@ -85,9 +85,9 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 
 ```text
 AI_PLANNER_MODE=always
-AI_RERANKER_MODE=auto
+AI_RERANKER_MODE=off
 AI_EVIDENCE_JUDGE_MODE=off
-AI_ANSWER_COMPOSER_MODE=always
+AI_ANSWER_COMPOSER_MODE=simple
 ```
 
 当前主流程是：
@@ -95,9 +95,8 @@ AI_ANSWER_COMPOSER_MODE=always
 ```text
 用户问题
   -> AI Query Planner
-  -> 本地 FTS / LIKE / BGE embedding 并行粗召回
-  -> AI Reranker
-  -> AI Answer Composer
+  -> 本地 FTS / LIKE / BGE embedding 并行粗召回与轻量排序
+  -> 单次 AI Answer Composer
   -> 硬规则校验
 ```
 

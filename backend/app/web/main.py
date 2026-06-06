@@ -240,14 +240,23 @@ def _run_search(payload: SearchRequest) -> SearchResponse:
         return response
     candidates = engine.search(plan, payload.profile, max(payload.limit * 3, 24))
     try:
-        candidates, reranker_report = reranker.rerank(effective_query, plan, candidates, payload.profile)
-        if reranker_report.notes:
-            plan.notes = f"{plan.notes or ''} AI reranker: {reranker_report.notes}".strip()
+        if settings.ai_reranker_mode in {"off", "false", "0", "disabled"}:
+            from ..ai.reranker import RerankerReport
+
+            reranker_report = RerankerReport(
+                status="skipped",
+                notes="AI Reranker 已关闭：使用本地 FTS/LIKE/BGE 综合分轻量排序。",
+                candidate_count=min(len(candidates), payload.limit),
+            )
+        else:
+            candidates, reranker_report = reranker.rerank(effective_query, plan, candidates, payload.profile)
+            if reranker_report.notes:
+                plan.notes = f"{plan.notes or ''} AI reranker: {reranker_report.notes}".strip()
         if settings.ai_evidence_judge_mode in {"off", "false", "0", "disabled"}:
             hits = candidates[: payload.limit]
             judge_report = EvidenceJudgeReport(
                 status="skipped",
-                notes="Evidence Judge 已关闭：本地检索结果直接交给 Fact Reader 总结。",
+                notes="Evidence Judge 已关闭：本地排序结果直接交给答案生成器。",
                 candidate_count=min(len(candidates), payload.limit),
             )
         else:
@@ -256,6 +265,7 @@ def _run_search(payload: SearchRequest) -> SearchResponse:
         if judge_report.notes:
             plan.notes = f"{plan.notes or ''} AI evidence judge: {judge_report.notes}".strip()
         answer = answerer.answer(payload.query, plan, hits)
+        hits = _reorder_hits_by_answer_sources(hits, answer)
     except AIUnavailableError as exc:
         plan.notes = f"{plan.notes or ''} {exc}".strip()
         response = SearchResponse(
@@ -270,6 +280,28 @@ def _run_search(payload: SearchRequest) -> SearchResponse:
     response = SearchResponse(query_plan=plan, hits=hits, answer=answer, evidence_judge=judge_report, session_id=session_id)
     _remember_session(session_id, payload.query, plan, payload.profile)
     return response
+
+
+def _reorder_hits_by_answer_sources(hits: list[SearchHit], answer: AnswerResult) -> list[SearchHit]:
+    if not hits or not answer.sources:
+        return hits
+    by_id: dict[int, SearchHit] = {}
+    for hit in hits:
+        by_id.setdefault(hit.id, hit)
+
+    ordered: list[SearchHit] = []
+    seen: set[int] = set()
+    for source in answer.sources:
+        hit = by_id.get(source.id)
+        if not hit or hit.id in seen:
+            continue
+        seen.add(hit.id)
+        ordered.append(hit)
+
+    for hit in hits:
+        if hit.id not in seen:
+            ordered.append(hit)
+    return ordered
 
 
 def _ai_unavailable_answer(reason: str) -> AnswerResult:

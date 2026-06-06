@@ -12,12 +12,18 @@ from ..storage import DocumentStore
 from .client import make_ai_client
 from .prompts import FACT_EXTRACTOR_SYSTEM
 from .prompts import LIGHT_READER_SYSTEMS
+from .prompts import SIMPLE_ANSWER_COMPOSER_SYSTEM
 from .validator import validate_answer_against_hits
 
 
 FACT_SOURCE_LIMIT = 8
+SIMPLE_SOURCE_LIMIT = 4
 FACT_PRIMARY_CONTEXT_CHARS = 1700
 FACT_SECONDARY_CONTEXT_CHARS = 1100
+SIMPLE_PRIMARY_CONTEXT_CHARS = 1100
+SIMPLE_SECONDARY_CONTEXT_CHARS = 620
+SIMPLE_RETRY_PRIMARY_CONTEXT_CHARS = 520
+SIMPLE_RETRY_SECONDARY_CONTEXT_CHARS = 340
 FACT_BODY_WINDOW_CHARS = 360
 FACT_MAX_CARDS = 14
 MAX_PARALLEL_READERS = 3
@@ -90,7 +96,7 @@ class Answerer:
                 hits,
             )
 
-        if not plan.need_answer_summary:
+        if not plan.need_answer_summary and not self._ai_enabled():
             return self._finalize_answer(self._document_list_answer(hits, evidence, warnings), hits)
 
         if not self._ai_enabled():
@@ -103,18 +109,181 @@ class Answerer:
                 hits,
             )
 
-        ai_answer = self._answer_with_ai_fact_cards(user_query, plan, hits, evidence, warnings)
+        if not plan.need_answer_summary and plan.intent in {"find_document", "attachment_query"}:
+            ai_answer = self._answer_with_simple_ai(user_query, plan, hits, evidence, warnings)
+            if ai_answer:
+                return self._finalize_answer(ai_answer, hits)
+            return self._finalize_answer(self._document_list_answer(hits, evidence, warnings), hits)
+
+        if not plan.need_answer_summary:
+            return self._finalize_answer(self._document_list_answer(hits, evidence, warnings), hits)
+
+        if settings.ai_answer_composer_mode in {"fact_cards", "reader", "readers"}:
+            ai_answer = self._answer_with_ai_fact_cards(user_query, plan, hits, evidence, warnings)
+        else:
+            ai_answer = self._answer_with_simple_ai(user_query, plan, hits, evidence, warnings)
         if ai_answer:
             return self._finalize_answer(ai_answer, hits)
 
+        warnings = self._dedupe_strings([*warnings, "AI 未能稳定生成总结，已改为展示最相关官网来源。"])
         return self._finalize_answer(
-            self._ai_unavailable_answer(
-                hits,
-                warnings,
-                "AI 摘要不可用：Fact Reader 调用失败，或 AI 未能从候选资料中抽取出可用答案。",
-            ),
+            self._document_list_answer(hits, evidence, warnings, summary_failed=True),
             hits,
         )
+
+    def _answer_with_simple_ai(
+        self,
+        user_query: str,
+        plan: QueryPlan,
+        hits: list[SearchHit],
+        evidence: list[EvidenceItem],
+        warnings: list[str],
+    ) -> AnswerResult | None:
+        sources = self._source_payload_for_fact_extraction(
+            plan,
+            hits,
+            source_limit=SIMPLE_SOURCE_LIMIT,
+            primary_context_chars=SIMPLE_PRIMARY_CONTEXT_CHARS,
+            secondary_context_chars=SIMPLE_SECONDARY_CONTEXT_CHARS,
+        )
+        if not sources:
+            return None
+        payload = self._simple_ai_payload(user_query, plan, sources, warnings)
+        try:
+            response = self._call_simple_composer(payload)
+        except Exception as exc:
+            retry_sources = self._source_payload_for_fact_extraction(
+                plan,
+                hits[:3],
+                source_limit=3,
+                primary_context_chars=SIMPLE_RETRY_PRIMARY_CONTEXT_CHARS,
+                secondary_context_chars=SIMPLE_RETRY_SECONDARY_CONTEXT_CHARS,
+            )
+            try:
+                response = self._call_simple_composer(
+                    self._simple_ai_payload(user_query, plan, retry_sources, warnings, retry=True)
+                )
+                sources = retry_sources
+            except Exception as retry_exc:
+                warnings.append(f"AI Composer 调用失败：{type(exc).__name__}; 精简重试失败：{type(retry_exc).__name__}")
+                return None
+        raw_content = response.choices[0].message.content or ""
+        payload = self._parse_json_object(raw_content) or self._payload_from_plain_answer(raw_content)
+        if not payload:
+            warnings.append("AI Composer 返回内容不是可解析 JSON。")
+            return None
+        answer = self._clean_multiline(
+            str(payload.get("final_answer") or payload.get("answer") or payload.get("direct_answer") or ""),
+            max_chars=6000,
+        )
+        if not answer:
+            warnings.append("AI Composer 未返回可展示答案。")
+            return None
+
+        used_refs = self._used_refs_from_payload(payload, answer)
+        ranked_refs = self._ranked_refs_from_payload(payload, used_refs)
+        source_hits = self._source_hits_from_refs(ranked_refs or used_refs, sources) or hits[: min(len(hits), 5)]
+        selected_evidence = self._evidence_from_refs(used_refs, evidence) or evidence[:5]
+        payload_warnings = [str(item) for item in payload.get("warnings", []) if str(item).strip()]
+        evidence_notes = self._source_review_notes(payload) + [
+            self._clean(str(item), max_chars=220)
+            for item in payload.get("evidence_notes", [])
+            if str(item).strip()
+        ]
+        answer = self._ensure_simple_answer_shape(answer, ranked_refs or used_refs, sources)
+        return AnswerResult(
+            answer=answer,
+            confidence=self._simple_confidence(payload, source_hits),
+            sources=source_hits,
+            evidence_notes=evidence_notes[:6],
+            evidence=selected_evidence,
+            warnings=self._dedupe_strings([*warnings, *payload_warnings]),
+        )
+
+    def _payload_from_plain_answer(self, content: str) -> dict[str, Any] | None:
+        answer = self._clean_multiline(content or "", max_chars=2200)
+        if not answer:
+            return None
+        repaired = self._extract_final_answer_from_jsonish_text(answer)
+        if repaired:
+            refs = self._dedupe_strings(re.findall(r"\[\d+\]", repaired))
+            return {
+                "final_answer": repaired,
+                "confidence": "medium" if refs else "low",
+                "ranked_refs": refs,
+                "used_refs": refs,
+                "warnings": ["AI Composer 返回了不完整 JSON，已提取 final_answer。"],
+            }
+        if len(answer) < 12:
+            return None
+        if re.search(r"^\s*(error|exception|traceback)", answer, flags=re.IGNORECASE):
+            return None
+        refs = self._dedupe_strings(re.findall(r"\[\d+\]", answer))
+        return {
+            "final_answer": answer,
+            "confidence": "medium" if refs else "low",
+            "ranked_refs": refs,
+            "used_refs": refs,
+            "warnings": ["AI Composer 未返回 JSON，已按纯文本答案解析。"],
+        }
+
+    @staticmethod
+    def _extract_final_answer_from_jsonish_text(text: str) -> str | None:
+        match = re.search(r'"final_answer"\s*:\s*"', text)
+        if not match:
+            return None
+        index = match.end()
+        chars: list[str] = []
+        escaped = False
+        while index < len(text):
+            ch = text[index]
+            if escaped:
+                if ch == "n":
+                    chars.append("\n")
+                elif ch == "t":
+                    chars.append("\t")
+                else:
+                    chars.append(ch)
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                break
+            else:
+                chars.append(ch)
+            index += 1
+        answer = "".join(chars).strip()
+        return answer if len(answer) >= 12 else None
+
+    def _call_simple_composer(self, payload: dict[str, Any]):
+        return self.client.chat.completions.create(
+            model=settings.ai_model,
+            temperature=0,
+            max_tokens=900,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SIMPLE_ANSWER_COMPOSER_SYSTEM},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+        )
+
+    def _simple_ai_payload(
+        self,
+        user_query: str,
+        plan: QueryPlan,
+        sources: list[dict[str, Any]],
+        warnings: list[str],
+        *,
+        retry: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "user_query": user_query,
+            "current_date": date.today().isoformat(),
+            "query_plan": self._compact_query_plan(plan),
+            "sources": [self._simple_source_payload(source) for source in sources],
+            "warnings": warnings[:5],
+            "mode": "compact_retry" if retry else "compact",
+        }
 
     def _answer_with_ai_fact_cards(
         self,
@@ -429,10 +598,14 @@ class Answerer:
         self,
         plan: QueryPlan,
         hits: list[SearchHit],
+        *,
+        source_limit: int = FACT_SOURCE_LIMIT,
+        primary_context_chars: int = FACT_PRIMARY_CONTEXT_CHARS,
+        secondary_context_chars: int = FACT_SECONDARY_CONTEXT_CHARS,
     ) -> list[dict[str, Any]]:
         sources: list[dict[str, Any]] = []
-        for index, hit in enumerate(hits[:FACT_SOURCE_LIMIT], start=1):
-            max_chars = FACT_PRIMARY_CONTEXT_CHARS if index <= 2 else FACT_SECONDARY_CONTEXT_CHARS
+        for index, hit in enumerate(hits[:source_limit], start=1):
+            max_chars = primary_context_chars if index <= 2 else secondary_context_chars
             context = self._source_context_for_reader(hit, plan, max_chars=max_chars)
             attachments = [
                 {"name": item.get("name"), "url": item.get("url")}
@@ -443,6 +616,8 @@ class Answerer:
             sources.append(
                 {
                     "ref": f"[{index}]",
+                    "local_rank": index,
+                    "local_score": round(float(hit.score), 4),
                     "title": hit.title,
                     "source": hit.source,
                     "category": hit.category,
@@ -526,6 +701,12 @@ class Answerer:
             if related_chunks:
                 related_chunks_block = "同篇文章相关文本块：\n" + related_chunks
 
+            table_rows = self._attachment_table_row_context(hit.id, focused_terms, max_chars=900)
+            if table_rows:
+                related_chunks_block = "\n".join(
+                    part for part in [related_chunks_block, "附件表格相关行：\n" + table_rows] if part
+                )
+
             body_intro = self._clean(body_text, max_chars=220)
             if body_intro and self._normalize_quote_text(body_intro[:80]) not in self._normalize_quote_text(focused_body):
                 body_intro_block = "文章开头：\n" + body_intro
@@ -544,7 +725,7 @@ class Answerer:
             snippet_block=snippet_block,
         )
         parts = [*header_parts, *evidence_blocks]
-        return self._trim_context("\n\n".join(part for part in parts if part.strip()), max_chars=max_chars)
+        return self._trim_context_blocks(parts, max_chars=max_chars)
 
     def _ai_metadata_hint(self, doc_id: int) -> dict[str, Any]:
         row = self.store.get_document(doc_id)
@@ -608,8 +789,10 @@ class Answerer:
                 score += 1
             if chunk_kind == "attachment_list" and term_score:
                 score += 1
-            if chunk_kind == "attachment_text" and term_score:
-                score += 1
+            if chunk_kind == "attachment_table_row" and term_score:
+                score += 6
+            elif chunk_kind == "attachment_text" and term_score:
+                score += 4
             if score <= 0:
                 continue
             type_priority = 3
@@ -619,8 +802,10 @@ class Answerer:
                 type_priority = 4
             elif chunk_kind == "attachment_list":
                 type_priority = 3
+            elif chunk_kind == "attachment_table_row":
+                type_priority = 5
             elif chunk_kind == "attachment_text":
-                type_priority = 1
+                type_priority = 3
             label_parts = [
                 chunk_kind or "正文",
                 str(row["heading"] or ""),
@@ -628,7 +813,7 @@ class Answerer:
                 f"第{row['page']}页" if row["page"] else "",
             ]
             label = " / ".join(part for part in label_parts if part)
-            chunk = f"[{label}] {self._clean(text, max_chars=320)}"
+            chunk = f"[{label}] {self._clean(text, max_chars=520 if chunk_kind in {'attachment_text', 'attachment_table_row'} else 320)}"
             scored.append((score, type_priority, -position, chunk))
         scored.sort(reverse=True)
         selected: list[str] = []
@@ -636,8 +821,8 @@ class Answerer:
         total = 0
         attachment_text_count = 0
         for _, _, _, chunk in scored:
-            if chunk.startswith("[attachment_text"):
-                if attachment_text_count >= (3 if task == "material" else 1):
+            if chunk.startswith("[attachment_text") or chunk.startswith("[attachment_table_row"):
+                if attachment_text_count >= (4 if task in {"material", "eligibility", "general"} else 2):
                     continue
                 attachment_text_count += 1
             key = self._normalize_quote_text(chunk[:120])
@@ -649,6 +834,68 @@ class Answerer:
             selected.append(chunk)
             total += len(chunk)
             if len(selected) >= 5:
+                break
+        return "\n".join(selected)
+
+    def _attachment_table_row_context(self, doc_id: int, terms: list[str], max_chars: int) -> str:
+        usable_terms = self._usable_terms(terms)
+        if not usable_terms:
+            return ""
+        try:
+            with self.store.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT heading, attachment_name, chunk_kind, chunk_text
+                    FROM document_chunks
+                    WHERE document_id = ?
+                      AND chunk_kind IN ('attachment_table_row', 'attachment_text')
+                    ORDER BY id
+                    LIMIT 160
+                    """,
+                    (doc_id,),
+                ).fetchall()
+        except Exception:
+            return ""
+        candidates: list[tuple[int, int, str]] = []
+        for position, row in enumerate(rows):
+            heading = str(row["heading"] or "")
+            attachment_name = str(row["attachment_name"] or "")
+            chunk_kind = str(row["chunk_kind"] or "")
+            text = str(row["chunk_text"] or "")
+            if chunk_kind == "attachment_table_row":
+                haystack = "\n".join([heading, attachment_name, text])
+                score = sum(1 for term in usable_terms[:36] if term and term in haystack)
+                if score > 0:
+                    label = " / ".join(part for part in [attachment_name, heading] if part)
+                    candidates.append((score + 4, -position, f"[{label}] {self._clean(text, max_chars=520)}"))
+                continue
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if not lines:
+                continue
+            header_lines = lines[:3]
+            for line_index, line in enumerate(lines):
+                haystack = "\n".join([heading, attachment_name, line])
+                score = sum(1 for term in usable_terms[:36] if term and term in haystack)
+                if score <= 0:
+                    continue
+                neighbor_lines = lines[max(0, line_index - 1) : min(len(lines), line_index + 2)]
+                context = "\n".join(self._dedupe_strings([*header_lines, *neighbor_lines]))
+                label = " / ".join(part for part in [attachment_name, heading] if part)
+                candidates.append((score, -position, f"[{label}] {self._clean(context, max_chars=420)}"))
+        candidates.sort(reverse=True)
+        selected: list[str] = []
+        seen: set[str] = set()
+        total = 0
+        for _, _, item in candidates:
+            key = self._normalize_quote_text(item[:160])
+            if key in seen:
+                continue
+            seen.add(key)
+            if total + len(item) > max_chars and selected:
+                break
+            selected.append(item)
+            total += len(item)
+            if len(selected) >= 4:
                 break
         return "\n".join(selected)
 
@@ -715,7 +962,7 @@ class Answerer:
     ) -> list[str]:
         """Order evidence by the user's requested answer shape."""
         if task == "deadline":
-            return [matched_block, focused_body_block, related_chunks_block, snippet_block, attachment_block, body_intro_block]
+            return [focused_body_block, related_chunks_block, matched_block, snippet_block, attachment_block, body_intro_block]
         if task == "eligibility":
             return [focused_body_block, related_chunks_block, matched_block, attachment_block, snippet_block, body_intro_block]
         if task == "process":
@@ -859,6 +1106,75 @@ class Answerer:
             public.pop("snippet", None)
             public.pop("ai_metadata_hint", None)
         return public
+
+    @staticmethod
+    def _simple_source_payload(source: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "ref",
+            "local_rank",
+            "local_score",
+            "title",
+            "source",
+            "category",
+            "publish_date",
+            "url",
+            "snippet",
+            "context",
+            "heading",
+            "page",
+            "attachment_name",
+            "chunk_kind",
+            "relevance_note",
+            "attachments",
+            "deadline",
+            "topics",
+            "keywords",
+        )
+        public = {key: source.get(key) for key in keys if key in source}
+        if isinstance(public.get("attachments"), list):
+            public["attachments"] = public["attachments"][:5]
+        for key in ("topics", "keywords"):
+            if isinstance(public.get(key), list):
+                public[key] = public[key][:8]
+        return public
+
+    @staticmethod
+    def _compact_query_plan(plan: QueryPlan) -> dict[str, Any]:
+        entities = plan.entities if isinstance(plan.entities, dict) else {}
+        compact_entities = {
+            key: entities.get(key)
+            for key in ("topic", "action", "college", "grade", "student_type", "requested_slots", "table_terms")
+            if entities.get(key)
+        }
+        return {
+            "intent": plan.intent,
+            "normalized_query": plan.normalized_query,
+            "sub_questions": plan.sub_questions[:4],
+            "retrieval_keywords": plan.retrieval_keywords[:16],
+            "expanded_queries": plan.expanded_queries[:10],
+            "entities": compact_entities,
+            "filters": {key: value for key, value in plan.filters.items() if value},
+            "time_scope": plan.time_scope,
+            "authority_preference": plan.authority_preference,
+        }
+
+    def _ensure_simple_answer_shape(self, answer: str, refs: list[str], sources: list[dict[str, Any]]) -> str:
+        output = answer.strip()
+        if output and not output.startswith("**"):
+            output = f"**结论：{output}**"
+        if refs and not re.search(r"\[\d+\]", output):
+            output = self._ensure_answer_references(output, [{"source_ref": ref} for ref in refs])
+        if "参考信息源" not in output and refs:
+            by_ref = {str(source.get("ref")): source for source in sources}
+            lines = [output.rstrip(), "", "参考信息源："]
+            for ref in refs[:5]:
+                source = by_ref.get(ref)
+                if not source:
+                    continue
+                date_part = f"，{source.get('publish_date')}" if source.get("publish_date") else ""
+                lines.append(f"{ref} {source.get('source')}：《{source.get('title')}》{date_part}，{source.get('url')}")
+            output = "\n".join(lines)
+        return output
 
     def _answer_from_reader_payload(
         self,
@@ -1082,6 +1398,121 @@ class Answerer:
         return hits
 
     @staticmethod
+    def _used_refs_from_payload(payload: dict[str, Any], answer: str) -> list[str]:
+        refs: list[str] = []
+        raw_refs = payload.get("used_refs")
+        if isinstance(raw_refs, list):
+            for item in raw_refs:
+                text = Answerer._normalize_ref(item)
+                if text and text not in refs:
+                    refs.append(text)
+        for ref in re.findall(r"\[\d+\]", answer or ""):
+            if ref not in refs:
+                refs.append(ref)
+        return refs
+
+    @staticmethod
+    def _ranked_refs_from_payload(payload: dict[str, Any], used_refs: list[str]) -> list[str]:
+        refs: list[str] = []
+        raw_ranked = payload.get("ranked_refs")
+        if isinstance(raw_ranked, list):
+            for item in raw_ranked:
+                text = Answerer._normalize_ref(item)
+                if text and text not in refs:
+                    refs.append(text)
+
+        if not refs:
+            reviews = payload.get("source_reviews")
+            if isinstance(reviews, list):
+                scored_refs: list[tuple[float, int, str]] = []
+                for index, review in enumerate(reviews):
+                    if not isinstance(review, dict):
+                        continue
+                    verdict = str(review.get("verdict") or "").strip().lower()
+                    if verdict not in {"direct", "partial", "weak"}:
+                        continue
+                    ref = Answerer._normalize_ref(review.get("ref"))
+                    if not ref:
+                        continue
+                    try:
+                        score = float(review.get("score") or 0)
+                    except (TypeError, ValueError):
+                        score = {"direct": 0.95, "partial": 0.65, "weak": 0.35}.get(verdict, 0.0)
+                    scored_refs.append((score, -index, ref))
+                for _, _, ref in sorted(scored_refs, reverse=True):
+                    if ref not in refs:
+                        refs.append(ref)
+
+        for ref in used_refs:
+            text = Answerer._normalize_ref(ref)
+            if text and text not in refs:
+                refs.append(text)
+        return refs
+
+    @staticmethod
+    def _normalize_ref(value: Any) -> str:
+        text = str(value or "").strip()
+        if re.fullmatch(r"\d+", text):
+            text = f"[{text}]"
+        return text if re.fullmatch(r"\[\d+\]", text) else ""
+
+    @staticmethod
+    def _source_review_notes(payload: dict[str, Any]) -> list[str]:
+        reviews = payload.get("source_reviews")
+        if not isinstance(reviews, list):
+            return []
+        notes: list[str] = []
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            ref = Answerer._normalize_ref(review.get("ref"))
+            verdict = str(review.get("verdict") or "").strip() or "unknown"
+            reason = Answerer._clean(str(review.get("reason") or ""), max_chars=120)
+            if not ref or not reason:
+                continue
+            raw_points = review.get("answer_points")
+            points: list[str] = []
+            if isinstance(raw_points, list):
+                points = [Answerer._clean(str(item), max_chars=80) for item in raw_points if str(item).strip()]
+            suffix = f"；答案点：{'；'.join(points[:2])}" if points else ""
+            notes.append(f"AI相关性判断 {ref}（{verdict}）：{reason}{suffix}")
+            if len(notes) >= 6:
+                break
+        return notes
+
+    @staticmethod
+    def _source_hits_from_refs(refs: list[str], sources: list[dict[str, Any]]) -> list[SearchHit]:
+        hits: list[SearchHit] = []
+        seen_ids: set[int] = set()
+        if refs:
+            by_ref = {str(source.get("ref")): source for source in sources}
+            ordered_sources = [by_ref[ref] for ref in refs if ref in by_ref]
+        else:
+            ordered_sources = sources
+        for source in ordered_sources:
+            hit = source.get("_hit")
+            if isinstance(hit, SearchHit) and hit.id not in seen_ids:
+                seen_ids.add(hit.id)
+                hits.append(hit)
+        return hits
+
+    @staticmethod
+    def _evidence_from_refs(refs: list[str], evidence: list[EvidenceItem]) -> list[EvidenceItem]:
+        if not refs:
+            return []
+        ref_set = set(refs)
+        return [item for item in evidence if item.ref in ref_set]
+
+    @staticmethod
+    def _simple_confidence(payload: dict[str, Any], sources: list[SearchHit]) -> str:
+        raw = str(payload.get("confidence") or "medium").strip().lower()
+        if raw in {"high", "medium", "low", "none"}:
+            if raw == "high" and not sources:
+                return "low"
+            return raw
+        return "medium" if sources else "none"
+
+    @staticmethod
     def _used_sources(facts: list[dict[str, Any]], sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
         used_refs = {fact["source_ref"] for fact in facts}
         return [source for source in sources if source["ref"] in used_refs]
@@ -1159,6 +1590,8 @@ class Answerer:
             return "title"
         if chunk_kind == "attachment_list":
             return "attachment_list"
+        if chunk_kind == "attachment_table_row":
+            return "table"
         if chunk_kind == "attachment_text" or attachment_name:
             return "attachment"
         if chunk_kind == "body":
@@ -1226,15 +1659,29 @@ class Answerer:
         hits: list[SearchHit],
         evidence: list[EvidenceItem],
         warnings: list[str],
+        *,
+        summary_failed: bool = False,
     ) -> AnswerResult:
         first = hits[0]
-        lines = [f"**结论：最相关原文是《{first.title}》。**", "", "我找到这些可能相关的官网原文："]
+        if summary_failed:
+            lines = [
+                f"**结论：已找到相关官网资料，但 AI 总结没有稳定生成；最相关来源是《{first.title}》。**",
+                "",
+                "建议优先打开前几条来源核对具体条件、考核方式或附件表格：",
+            ]
+        else:
+            lines = [f"**结论：最相关原文是《{first.title}》。**", "", "我找到这些可能相关的官网原文："]
         for index, hit in enumerate(hits[:8], start=1):
             date_part = f"，{hit.publish_date}" if hit.publish_date else ""
             category_part = f" / {hit.category}" if hit.category else ""
             lines.append(f"{index}. 《{hit.title}》")
             lines.append(f"   来源：{hit.source}{category_part}{date_part}")
             lines.append(f"   链接：{hit.url}")
+            if hit.attachment_name:
+                page_part = f"，第{hit.page}页" if hit.page else ""
+                lines.append(f"   命中附件：{hit.attachment_name}{page_part}")
+            if hit.relevance_note:
+                lines.append(f"   检索判断：{hit.relevance_note}")
             if hit.attachments:
                 names = "、".join(item.get("name", "附件") for item in hit.attachments[:3])
                 lines.append(f"   附件：{names}")
@@ -1243,7 +1690,7 @@ class Answerer:
             lines.append("提示：" + "；".join(warnings[:3]))
         return AnswerResult(
             answer="\n".join(lines),
-            confidence="medium",
+            confidence="low" if summary_failed else "medium",
             sources=hits[:8],
             evidence=evidence,
             warnings=warnings,
@@ -1276,7 +1723,31 @@ class Answerer:
         if not (result.answer or "").lstrip().startswith("**"):
             lead = self._first_sentence(result.answer) or "结论：未找到足够的官网依据，不能直接给出确定答案。"
             result.answer = f"**{lead}**\n\n{result.answer}"
+        result.answer = self._normalize_reference_source_urls(result.answer, hits)
         return validate_answer_against_hits(result, hits)
+
+    @staticmethod
+    def _normalize_reference_source_urls(answer: str, hits: list[SearchHit]) -> str:
+        if not answer or "参考信息源" not in answer:
+            return answer
+        ref_urls = {f"[{index}]": hit.url for index, hit in enumerate(hits, start=1) if hit.url}
+        in_references = False
+        lines: list[str] = []
+        for line in answer.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("参考信息源"):
+                in_references = True
+                lines.append(line)
+                continue
+            if in_references and re.match(r"^(#{1,6}\s+)?\S", stripped) and not re.match(r"^(?:[-*]\s*)?\[\d+\]", stripped):
+                in_references = False
+            if in_references:
+                match = re.match(r"^(?:[-*]\s*)?(\[\d+\])", stripped)
+                if match and match.group(1) in ref_urls:
+                    canonical_url = ref_urls[match.group(1)]
+                    line = re.sub(r"https?://[^\s)）\]】>,，。；;\"']+", canonical_url, line)
+            lines.append(line)
+        return "\n".join(lines)
 
     def _source_support_text(self, hit: SearchHit, context: str, attachments: list[dict[str, Any]]) -> str:
         parts = [
@@ -1333,7 +1804,29 @@ class Answerer:
         text = re.sub(r"\n{3,}", "\n\n", text or "").strip()
         if len(text) <= max_chars:
             return text
-        return text[:max_chars].rstrip() + "\n...[已截断]"
+        marker = "\n...[已截断]"
+        keep = max(0, max_chars - len(marker))
+        return text[:keep].rstrip() + marker
+
+    @staticmethod
+    def _trim_context_blocks(blocks: list[str], max_chars: int) -> str:
+        selected: list[str] = []
+        total = 0
+        for block in blocks:
+            text = re.sub(r"\n{3,}", "\n\n", str(block or "")).strip()
+            if not text:
+                continue
+            if total + len(text) + 2 <= max_chars:
+                selected.append(text)
+                total += len(text) + 2
+                continue
+            remaining = max_chars - total - 8
+            if remaining >= 120:
+                selected.append(text[:remaining].rstrip() + "\n...[已截断]")
+            break
+        if selected:
+            return Answerer._trim_context("\n\n".join(selected).strip(), max_chars)
+        return Answerer._trim_context("\n\n".join(str(block or "") for block in blocks), max_chars)
 
     @staticmethod
     def _clean(text: str, max_chars: int = 360) -> str:

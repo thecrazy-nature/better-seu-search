@@ -170,9 +170,6 @@ foreach ($pidText in $oldPids) {
     }
 }
 
-Write-Output "Repairing index metadata..."
-& $python -m backend.app.repair_index_metadata
-
 if ($SeedDemo) {
     & $python -m backend.app.seed_demo
 }

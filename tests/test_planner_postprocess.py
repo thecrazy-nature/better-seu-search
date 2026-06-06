@@ -21,9 +21,10 @@ class PlannerPostprocessTest(unittest.TestCase):
 
         processed = planner._apply_safety_normalization(plan, "四六级报名时间", UserProfile(student_type="本科生"))
 
-        self.assertEqual(processed.intent, "deadline_query")
         self.assertTrue(processed.need_answer_summary)
         self.assertIn("time", processed.entities["requested_slots"])
+        self.assertIn("四六级", processed.retrieval_keywords)
+        self.assertIn("报名", processed.retrieval_keywords)
 
 
 if __name__ == "__main__":
