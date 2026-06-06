@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>东南大学官网智能检索</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260606-2" />
   </head>
   <body>
     <main class="shell">
@@ -82,14 +82,36 @@
         </div>
 
         <form id="assistantForm" class="search-form">
-          <div class="assistant-mode-row">
-            <label>
-              助手类型
-              <select id="assistantModeInput">
-                <option value="reimbursement">项目报销</option>
-                <option value="overseas">出国申请</option>
-              </select>
-            </label>
+          <div class="assistant-mode-stack">
+            <div class="assistant-mode-cards" role="tablist" aria-label="助手类型">
+              <button
+                type="button"
+                class="assistant-mode-card is-active"
+                data-assistant-mode="reimbursement"
+                aria-pressed="true"
+              >
+                <strong>项目报销</strong>
+                <span>报销流程、材料、地点、时限和风险提醒</span>
+              </button>
+              <button
+                type="button"
+                class="assistant-mode-card"
+                data-assistant-mode="overseas"
+                aria-pressed="false"
+              >
+                <strong>出国申请</strong>
+                <span>出国审批、材料准备、签证和返校后续事项</span>
+              </button>
+            </div>
+            <div class="assistant-mode-row" hidden>
+              <label>
+                助手类型
+                <select id="assistantModeInput">
+                  <option value="reimbursement">项目报销</option>
+                  <option value="overseas">出国申请</option>
+                </select>
+              </label>
+            </div>
           </div>
           <div class="query-row">
             <input
@@ -195,6 +217,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260606-2"></script>
   </body>
 </html>
