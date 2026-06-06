@@ -2,7 +2,8 @@ param(
     [int]$Port = 8000,
     [switch]$SeedDemo,
     [switch]$Foreground,
-    [switch]$Lan
+    [switch]$Lan,
+    [string]$EmbeddingProvider = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -154,6 +155,13 @@ $bindHost = if ($Lan) { "0.0.0.0" } else { "127.0.0.1" }
 $localUrl = "http://127.0.0.1:$Port/"
 $healthUrl = "http://127.0.0.1:$Port/api/health"
 $lanUrls = if ($Lan) { Get-LanAccessUrls -Port $Port } else { @() }
+
+if (-not $EmbeddingProvider) {
+    $EmbeddingProvider = $env:EMBEDDING_PROVIDER
+}
+if ($EmbeddingProvider) {
+    $env:EMBEDDING_PROVIDER = $EmbeddingProvider
+}
 
 if ($Lan) {
     Ensure-LanFirewallRule -Port $Port

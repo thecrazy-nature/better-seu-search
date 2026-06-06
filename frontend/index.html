@@ -143,10 +143,129 @@
           </ul>
         </section>
       </section>
+
+      <section class="official-width feature-grid" aria-label="扩展功能">
+        <section class="feature-card">
+          <span class="eyebrow">校内私人助理</span>
+          <h2>项目报销助手</h2>
+          <p>根据项目、费用、发票日期等信息，生成报销材料、流程、地点和风险提醒。</p>
+          <button class="secondary-action" type="button" data-assistant-open="reimbursement">打开助手</button>
+        </section>
+        <section class="feature-card">
+          <span class="eyebrow">校内私人助理</span>
+          <h2>出国申请助手</h2>
+          <p>面向本科生、研究生和教师，整理出国审批、材料准备、签证和返校后续事项。</p>
+          <button class="secondary-action" type="button" data-assistant-open="overseas">打开助手</button>
+        </section>
+        <section class="feature-card">
+          <span class="eyebrow">数据库管理</span>
+          <h2>多数据库集</h2>
+          <p>管理不同官网集合、站点配置和爬取范围，让检索限定在当前选择的数据源内。</p>
+          <a class="secondary-action" href="/admin/collections">管理数据库集</a>
+        </section>
+      </section>
     </main>
 
     <button id="crawlButton" class="crawl-button" type="button" hidden>更新索引</button>
     <section id="status" class="status-toast" hidden></section>
+
+    <div id="assistantOverlay" class="result-overlay" hidden>
+      <section class="result-dialog assistant-dialog" role="dialog" aria-modal="true" aria-labelledby="assistantTitle">
+        <header class="dialog-head">
+          <div>
+            <span id="assistantEyebrow" class="eyebrow">校内私人助理</span>
+            <h2 id="assistantTitle">项目报销助手</h2>
+          </div>
+          <button id="closeAssistant" class="icon-button" type="button" aria-label="关闭助手">×</button>
+        </header>
+
+        <div class="dialog-body">
+          <form id="assistantForm" class="assistant-form">
+            <label>
+              问题
+              <textarea
+                id="assistantQuestionInput"
+                rows="3"
+                placeholder="例如：我的项目产生了一笔差旅费用，应该怎么报销？"
+                required
+              ></textarea>
+            </label>
+
+            <div id="reimbursementFields" class="assistant-grid">
+              <label>
+                项目名称
+                <input id="projectNameInput" placeholder="可选，例如 xxx" />
+              </label>
+              <label>
+                项目号/经费号
+                <input id="projectCodeInput" placeholder="可选，例如 6xxxxxxx" />
+              </label>
+              <label>
+                费用类型
+                <input id="expenseTypeInput" placeholder="差旅 / 材料 / 设备 / 版面费" />
+              </label>
+              <label>
+                发票日期
+                <input id="invoiceDateInput" placeholder="YYYY-MM-DD" />
+              </label>
+              <label>
+                付款对象
+                <select id="paymentTargetInput">
+                  <option value="">暂不确定</option>
+                  <option value="个人">个人</option>
+                  <option value="单位">单位</option>
+                </select>
+              </label>
+            </div>
+
+            <div id="overseasFields" class="assistant-grid" hidden>
+              <label>
+                申请人身份
+                <select id="applicantTypeInput">
+                  <option value="">暂不确定</option>
+                  <option value="本科生">本科生</option>
+                  <option value="研究生">研究生</option>
+                  <option value="教师">教师</option>
+                </select>
+              </label>
+              <label>
+                目的地
+                <input id="destinationInput" placeholder="例如 日本 / 港澳 / 美国" />
+              </label>
+              <label>
+                出访类型
+                <input id="visitTypeInput" placeholder="国际会议 / 交换 / 访学 / CSC" />
+              </label>
+              <label>
+                经费来源
+                <input id="fundingSourceInput" placeholder="自费 / 公费 / 导师科研项目" />
+              </label>
+              <label>
+                计划出发日期
+                <input id="startDateInput" placeholder="YYYY-MM-DD" />
+              </label>
+            </div>
+
+            <button class="primary-action" type="submit">生成办理建议</button>
+          </form>
+
+          <section id="assistantAnswerPanel" class="answer-panel" hidden>
+            <div class="section-title">
+              <h3>办理建议</h3>
+            </div>
+            <div id="assistantAnswerText" class="answer-text"></div>
+          </section>
+
+          <section id="assistantSourcesPanel" class="results-panel" hidden>
+            <div class="section-title">
+              <h3>引用来源</h3>
+              <span id="assistantSourceCount"></span>
+            </div>
+            <div id="assistantSources"></div>
+          </section>
+        </div>
+      </section>
+    </div>
 
     <div id="resultOverlay" class="result-overlay" hidden>
       <section class="result-dialog" role="dialog" aria-modal="true" aria-labelledby="resultTitle">
@@ -209,6 +328,6 @@
       </section>
     </div>
 
-    <script src="/static/app.js?v=20260606-sort-modes"></script>
+    <script src="/static/app.js?v=20260607-merge"></script>
   </body>
 </html>

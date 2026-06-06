@@ -82,8 +82,41 @@ def configured_seed_sites() -> list[dict]:
         if isinstance(source, str) and isinstance(base, str) and isinstance(seeds, list):
             clean_seeds = [seed for seed in seeds if isinstance(seed, str)]
             if clean_seeds:
-                sites.append({"source": source, "base": base, "seeds": clean_seeds})
+                sites.append(
+                    {
+                        "source": source,
+                        "base": base,
+                        "seeds": clean_seeds,
+                        "include_path_prefixes": [],
+                        "exclude_path_prefixes": [],
+                        "max_depth": None,
+                        "max_pages": None,
+                        "days_back": None,
+                    }
+                )
     return sites
+
+
+def normalized_site_config(site: dict) -> dict:
+    source = str(site.get("source") or "").strip()
+    base = str(site.get("base") or "").strip()
+    seeds = [str(seed).strip() for seed in site.get("seeds") or [] if str(seed).strip()]
+    include_path_prefixes = [
+        str(prefix).strip() for prefix in site.get("include_path_prefixes") or [] if str(prefix).strip()
+    ]
+    exclude_path_prefixes = [
+        str(prefix).strip() for prefix in site.get("exclude_path_prefixes") or [] if str(prefix).strip()
+    ]
+    return {
+        "source": source,
+        "base": base,
+        "seeds": seeds or [base],
+        "include_path_prefixes": include_path_prefixes,
+        "exclude_path_prefixes": exclude_path_prefixes,
+        "max_depth": site.get("max_depth"),
+        "max_pages": site.get("max_pages"),
+        "days_back": site.get("days_back"),
+    }
 
 
 def normalize_url(base_url: str, href: str) -> str | None:
@@ -108,11 +141,23 @@ def hash_content(title: str, body: str, url: str, attachments: list[dict] | None
 
 
 class PublicSiteCrawler:
-    def __init__(self, max_pages_per_site: int | None = None, delay_seconds: float | None = None) -> None:
+    def __init__(
+        self,
+        max_pages_per_site: int | None = None,
+        delay_seconds: float | None = None,
+        sites: list[dict] | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
+    ) -> None:
         self.max_pages_per_site = max_pages_per_site or settings.crawl_max_pages_per_site
         self.delay_seconds = settings.crawl_delay_seconds if delay_seconds is None else delay_seconds
         self.max_depth = settings.crawl_max_depth
         self.cutoff_date = date.today() - timedelta(days=settings.crawl_days_back)
+        self.sites = [normalized_site_config(site) for site in (sites or configured_seed_sites())]
+        self.progress_callback = progress_callback
+        self.total_target_pages = sum(
+            int(site.get("max_pages") or self.max_pages_per_site)
+            for site in self.sites
+        ) or len(self.sites) or 1
         self.report: dict = {
             "cutoff_date": self.cutoff_date.isoformat(),
             "sites": {},
@@ -130,12 +175,21 @@ class PublicSiteCrawler:
         verbose: bool = False,
     ) -> list[SourceDocument]:
         docs: list[SourceDocument] = []
-        for site in configured_seed_sites():
+        for site in self.sites:
             docs.extend(
                 self.crawl_site(
                     site["source"],
                     site["base"],
                     site["seeds"],
+                    include_path_prefixes=site.get("include_path_prefixes"),
+                    exclude_path_prefixes=site.get("exclude_path_prefixes"),
+                    max_depth=site.get("max_depth"),
+                    max_pages=site.get("max_pages"),
+                    cutoff_date=(
+                        date.today() - timedelta(days=int(site["days_back"]))
+                        if site.get("days_back")
+                        else self.cutoff_date
+                    ),
                     on_document=on_document,
                     verbose=verbose,
                 )
@@ -148,6 +202,11 @@ class PublicSiteCrawler:
         source: str,
         base_url: str,
         seeds: list[str],
+        include_path_prefixes: list[str] | None = None,
+        exclude_path_prefixes: list[str] | None = None,
+        max_depth: int | None = None,
+        max_pages: int | None = None,
+        cutoff_date: date | None = None,
         on_document: Callable[[SourceDocument], None] | None = None,
         verbose: bool = False,
     ) -> list[SourceDocument]:
@@ -155,10 +214,20 @@ class PublicSiteCrawler:
         queue: deque[tuple[str, int]] = deque((seed, 0) for seed in seeds)
         seen: set[str] = set()
         docs: list[SourceDocument] = []
+        site_max_depth = self.max_depth if max_depth is None else max_depth
+        site_max_pages = self.max_pages_per_site if max_pages is None else max_pages
+        site_cutoff_date = cutoff_date or self.cutoff_date
+        include_path_prefixes = [prefix for prefix in include_path_prefixes or [] if prefix]
+        exclude_path_prefixes = [prefix for prefix in exclude_path_prefixes or [] if prefix]
         site_report = {
             "source": source,
             "base_url": base_url,
             "seed_count": len(seeds),
+            "include_path_prefixes": include_path_prefixes,
+            "exclude_path_prefixes": exclude_path_prefixes,
+            "max_depth": site_max_depth,
+            "max_pages": site_max_pages,
+            "cutoff_date": site_cutoff_date.isoformat(),
             "visited_count": 0,
             "document_count": 0,
             "skipped_old_count": 0,
@@ -170,13 +239,16 @@ class PublicSiteCrawler:
         "hit_page_limit": False,
         }
         self.report["sites"][source] = site_report
+        self._emit_progress(source, site_report, stage="site_started", force=True)
 
-        while queue and len(seen) < self.max_pages_per_site:
+        while queue and len(seen) < site_max_pages:
             url, depth = queue.popleft()
             if url in seen:
                 continue
             seen.add(url)
             site_report["visited_count"] = len(seen)
+            if len(seen) == 1 or len(seen) % 10 == 0:
+                self._emit_progress(source, site_report, stage="crawling")
             if self._is_file_url(url):
                 site_report["file_link_count"] += 1
                 continue
@@ -189,9 +261,15 @@ class PublicSiteCrawler:
             soup = BeautifulSoup(response.text, "html.parser")
             if self._looks_like_list_page(url):
                 site_report["list_pages"].append(url)
-            if depth < self.max_depth:
-                for link in self._extract_links(soup, url, allowed_netloc):
-                    if link not in seen and len(seen) + len(queue) < self.max_pages_per_site * 3:
+            if depth < site_max_depth:
+                for link in self._extract_links(
+                    soup,
+                    url,
+                    allowed_netloc,
+                    include_path_prefixes=include_path_prefixes,
+                    exclude_path_prefixes=exclude_path_prefixes,
+                ):
+                    if link not in seen and len(seen) + len(queue) < site_max_pages * 3:
                         queue.append((link, depth + 1))
             skip_reason = self._skip_document_reason(url, soup)
             if skip_reason:
@@ -199,7 +277,7 @@ class PublicSiteCrawler:
                 continue
             doc = self._parse_document(soup, url, source)
             if doc:
-                if doc.publish_date and doc.publish_date < self.cutoff_date:
+                if doc.publish_date and doc.publish_date < site_cutoff_date:
                     site_report["skipped_old_count"] += 1
                 else:
                     if on_document:
@@ -216,7 +294,7 @@ class PublicSiteCrawler:
                 )
                 self.write_report()
             time.sleep(self.delay_seconds)
-        site_report["hit_page_limit"] = bool(queue and len(seen) >= self.max_pages_per_site)
+        site_report["hit_page_limit"] = bool(queue and len(seen) >= site_max_pages)
         if verbose:
             print(
                 f"[{source}] done visited={len(seen)} docs={site_report['document_count']} "
@@ -224,7 +302,36 @@ class PublicSiteCrawler:
                 flush=True,
             )
             self.write_report()
+        self._emit_progress(source, site_report, stage="site_completed", force=True)
         return docs
+
+    def _emit_progress(self, source: str, site_report: dict, *, stage: str, force: bool = False) -> None:
+        if self.progress_callback is None:
+            return
+        visited_total = sum(int(item.get("visited_count") or 0) for item in self.report["sites"].values())
+        document_total = sum(int(item.get("document_count") or 0) for item in self.report["sites"].values())
+        progress_total = max(1, int(self.total_target_pages))
+        progress_current = min(progress_total, visited_total)
+        progress_percent = min(0.95, progress_current / progress_total)
+        message = (
+            f"Crawling {source}: visited {site_report.get('visited_count', 0)}/"
+            f"{site_report.get('max_pages', self.max_pages_per_site)} pages, "
+            f"documents {site_report.get('document_count', 0)}"
+        )
+        self.progress_callback(
+            {
+                "phase": "crawling",
+                "stage": stage,
+                "message": message,
+                "current_site": source,
+                "progress_current": progress_current,
+                "progress_total": progress_total,
+                "progress_percent": round(progress_percent, 4),
+                "visited_pages": visited_total,
+                "document_count": document_total,
+                "force": force,
+            }
+        )
 
     def write_report(self) -> None:
         settings.crawl_report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,7 +355,15 @@ class PublicSiteCrawler:
         except Exception:
             return None
 
-    def _extract_links(self, soup: BeautifulSoup, page_url: str, allowed_netloc: str) -> list[str]:
+    def _extract_links(
+        self,
+        soup: BeautifulSoup,
+        page_url: str,
+        allowed_netloc: str,
+        *,
+        include_path_prefixes: list[str] | None = None,
+        exclude_path_prefixes: list[str] | None = None,
+    ) -> list[str]:
         links: list[str] = []
         for anchor in soup.find_all("a", href=True):
             url = normalize_url(page_url, anchor.get("href", ""))
@@ -261,8 +376,25 @@ class PublicSiteCrawler:
                 continue
             if any(part in url for part in ["/_upload/", "/_t", "/main.htm"]):
                 continue
+            if not self._path_allowed(parsed.path, include_path_prefixes, exclude_path_prefixes):
+                continue
             links.append(url)
         return links
+
+    @staticmethod
+    def _path_allowed(
+        path: str,
+        include_path_prefixes: list[str] | None = None,
+        exclude_path_prefixes: list[str] | None = None,
+    ) -> bool:
+        clean_path = path or "/"
+        excludes = [prefix for prefix in exclude_path_prefixes or [] if prefix]
+        if any(clean_path.startswith(prefix) for prefix in excludes):
+            return False
+        includes = [prefix for prefix in include_path_prefixes or [] if prefix]
+        if not includes:
+            return True
+        return any(clean_path.startswith(prefix) for prefix in includes)
 
     def _parse_document(self, soup: BeautifulSoup, url: str, source: str) -> SourceDocument | None:
         title = self._extract_title(soup)

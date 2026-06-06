@@ -103,7 +103,13 @@ class SearchEngine:
         self.store = store or DocumentStore()
         self.source_profiles: dict[str, dict] = {}
 
-    def search(self, plan: QueryPlan, profile: UserProfile | None = None, limit: int = 10) -> list[SearchHit]:
+    def search(
+        self,
+        plan: QueryPlan,
+        profile: UserProfile | None = None,
+        limit: int = 10,
+        collection_id: int | None = None,
+    ) -> list[SearchHit]:
         profile = profile or UserProfile()
         self.source_profiles = self.store.get_source_profiles()
         query_candidates = self._query_candidates(plan)
@@ -115,8 +121,7 @@ class SearchEngine:
                 if not fts:
                     continue
                 try:
-                    rows = conn.execute(
-                        """
+                    sql = """
                         SELECT d.*,
                                c.chunk_text AS chunk_text,
                                c.heading AS heading,
@@ -129,12 +134,23 @@ class SearchEngine:
                         FROM document_chunks_fts
                         JOIN document_chunks c ON c.id = document_chunks_fts.rowid
                         JOIN documents d ON d.id = c.document_id
+                    """
+                    params: list[object] = []
+                    if collection_id is not None:
+                        sql += " JOIN collection_documents cd ON cd.document_id = d.id "
+                    sql += """
                         WHERE document_chunks_fts MATCH ?
+                    """
+                    if collection_id is not None:
+                        sql += " AND cd.collection_id = ? "
+                    sql += """
                         ORDER BY rank
                         LIMIT 60
-                        """,
-                        (fts,),
-                    ).fetchall()
+                    """
+                    params.append(fts)
+                    if collection_id is not None:
+                        params.append(collection_id)
+                    rows = conn.execute(sql, tuple(params)).fetchall()
                 except Exception:
                     rows = []
                 for row in rows:
@@ -148,20 +164,32 @@ class SearchEngine:
 
             like_terms = self._like_terms(plan, query_candidates)
             for term in like_terms[:16]:
-                rows = conn.execute(
-                    """
+                sql = """
                     SELECT *
                     FROM documents
-                    WHERE title LIKE ?
-                       OR body LIKE ?
-                       OR attachments_json LIKE ?
-                       OR topics_json LIKE ?
-                       OR keywords_json LIKE ?
+                """
+                params: list[object] = []
+                if collection_id is not None:
+                    sql += " JOIN collection_documents cd ON cd.document_id = documents.id "
+                sql += """
+                    WHERE (
+                           title LIKE ?
+                        OR body LIKE ?
+                        OR attachments_json LIKE ?
+                        OR topics_json LIKE ?
+                        OR keywords_json LIKE ?
+                    )
+                """
+                if collection_id is not None:
+                    sql += " AND cd.collection_id = ? "
+                sql += """
                     ORDER BY publish_date DESC, id DESC
                     LIMIT 30
-                    """,
-                    (f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%"),
-                ).fetchall()
+                """
+                params.extend([f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%"])
+                if collection_id is not None:
+                    params.append(collection_id)
+                rows = conn.execute(sql, tuple(params)).fetchall()
                 for row in rows:
                     snippet = self._make_snippet(row["body"], term)
                     base_score = 2.0 if term in (row["title"] or "") else 0.8
@@ -172,26 +200,44 @@ class SearchEngine:
                         rows_by_id[hit_dict["id"]] = (hit_dict, score)
 
             if not rows_by_id and plan.intent == "latest_updates":
-                rows = conn.execute(
-                    """
+                sql = """
                     SELECT * FROM documents
+                """
+                params: list[object] = []
+                if collection_id is not None:
+                    sql += " JOIN collection_documents cd ON cd.document_id = documents.id "
+                    sql += " WHERE cd.collection_id = ? "
+                    params.append(collection_id)
+                sql += """
                     ORDER BY publish_date DESC NULLS LAST, id DESC
                     LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
+                """
+                params.append(limit)
+                rows = conn.execute(sql, tuple(params)).fetchall()
                 for row in rows:
                     hit_dict = row_to_hit(row, 1.0, row["body"][:180])
                     rows_by_id[hit_dict["id"]] = (hit_dict, self._score(hit_dict, plan, profile, 1.0))
 
             if plan.intent == "profile_query" and len(rows_by_id) < max(4, limit // 2):
-                for hit_dict, score in self._profile_candidates(conn, plan, profile, limit=limit * 2):
+                for hit_dict, score in self._profile_candidates(
+                    conn,
+                    plan,
+                    profile,
+                    limit=limit * 2,
+                    collection_id=collection_id,
+                ):
                     old = rows_by_id.get(hit_dict["id"])
                     if old is None or score > old[1]:
                         rows_by_id[hit_dict["id"]] = (hit_dict, score)
 
             if self._should_use_vector_recall(plan):
-                for hit_dict, score in self._vector_candidates(conn, plan, profile, limit=VECTOR_CANDIDATE_LIMIT):
+                for hit_dict, score in self._vector_candidates(
+                    conn,
+                    plan,
+                    profile,
+                    limit=VECTOR_CANDIDATE_LIMIT,
+                    collection_id=collection_id,
+                ):
                     old = rows_by_id.get(hit_dict["id"])
                     if old is None or score > old[1]:
                         rows_by_id[hit_dict["id"]] = (hit_dict, score)
@@ -210,11 +256,17 @@ class SearchEngine:
             for hit, score in ranked[:limit]
         ]
 
-    def _vector_candidates(self, conn, plan: QueryPlan, profile: UserProfile, limit: int) -> list[tuple[dict, float]]:
+    def _vector_candidates(
+        self,
+        conn,
+        plan: QueryPlan,
+        profile: UserProfile,
+        limit: int,
+        collection_id: int | None = None,
+    ) -> list[tuple[dict, float]]:
         query_text = " ".join(self._query_candidates(plan)[:8])
         query_vector = embed_text(query_text)
-        rows = conn.execute(
-            """
+        sql = """
             SELECT d.*,
                    c.chunk_text AS chunk_text,
                    c.heading AS heading,
@@ -225,13 +277,22 @@ class SearchEngine:
                    c.embedding_json AS embedding_json
             FROM document_chunks c
             JOIN documents d ON d.id = c.document_id
+        """
+        params: list[object] = []
+        if collection_id is not None:
+            sql += " JOIN collection_documents cd ON cd.document_id = d.id "
+        sql += """
             WHERE c.embedding_json IS NOT NULL
+        """
+        if collection_id is not None:
+            sql += " AND cd.collection_id = ? "
+            params.append(collection_id)
+        sql += """
             ORDER BY c.id DESC
             LIMIT ?
-            """
-            ,
-            (VECTOR_SCAN_LIMIT,),
-        ).fetchall()
+        """
+        params.append(VECTOR_SCAN_LIMIT)
+        rows = conn.execute(sql, tuple(params)).fetchall()
         candidates: list[tuple[dict, float]] = []
         for row in rows:
             if not embedding_json_matches_current(row["embedding_json"]):
@@ -261,27 +322,46 @@ class SearchEngine:
             score += 0.25
         return max(0.1, score)
 
-    def _profile_candidates(self, conn, plan: QueryPlan, profile: UserProfile, limit: int) -> list[tuple[dict, float]]:
+    def _profile_candidates(
+        self,
+        conn,
+        plan: QueryPlan,
+        profile: UserProfile,
+        limit: int,
+        collection_id: int | None = None,
+    ) -> list[tuple[dict, float]]:
         terms = self._profile_terms(plan, profile)
         if not terms:
             return []
         rows_by_id: dict[int, tuple[dict, float]] = {}
         for term in terms[:10]:
-            rows = conn.execute(
-                """
+            sql = """
                 SELECT *
                 FROM documents
-                WHERE source LIKE ?
-                   OR title LIKE ?
-                   OR body LIKE ?
-                   OR applicable_colleges_json LIKE ?
-                   OR applicable_grades_json LIKE ?
-                   OR student_types_json LIKE ?
+            """
+            params: list[object] = []
+            if collection_id is not None:
+                sql += " JOIN collection_documents cd ON cd.document_id = documents.id "
+            sql += """
+                WHERE (
+                       source LIKE ?
+                    OR title LIKE ?
+                    OR body LIKE ?
+                    OR applicable_colleges_json LIKE ?
+                    OR applicable_grades_json LIKE ?
+                    OR student_types_json LIKE ?
+                )
+            """
+            if collection_id is not None:
+                sql += " AND cd.collection_id = ? "
+            sql += """
                 ORDER BY publish_date DESC, id DESC
                 LIMIT 30
-                """,
-                (f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%"),
-            ).fetchall()
+            """
+            params.extend([f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%"])
+            if collection_id is not None:
+                params.append(collection_id)
+            rows = conn.execute(sql, tuple(params)).fetchall()
             for row in rows:
                 hit_dict = row_to_hit(row, 0.7, self._make_snippet(row["body"], term))
                 score = self._score(hit_dict, plan, profile, 0.7)

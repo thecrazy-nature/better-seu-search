@@ -23,11 +23,34 @@ const closeResults = document.querySelector("#closeResults");
 const resultCount = document.querySelector("#resultCount");
 const confidenceBadge = document.querySelector("#confidenceBadge");
 const sortButtons = document.querySelectorAll("[data-sort-mode]");
+const assistantOverlay = document.querySelector("#assistantOverlay");
+const closeAssistant = document.querySelector("#closeAssistant");
+const assistantTitle = document.querySelector("#assistantTitle");
+const assistantQuestionInput = document.querySelector("#assistantQuestionInput");
+const assistantForm = document.querySelector("#assistantForm");
+const reimbursementFields = document.querySelector("#reimbursementFields");
+const overseasFields = document.querySelector("#overseasFields");
+const projectNameInput = document.querySelector("#projectNameInput");
+const projectCodeInput = document.querySelector("#projectCodeInput");
+const expenseTypeInput = document.querySelector("#expenseTypeInput");
+const invoiceDateInput = document.querySelector("#invoiceDateInput");
+const paymentTargetInput = document.querySelector("#paymentTargetInput");
+const applicantTypeInput = document.querySelector("#applicantTypeInput");
+const destinationInput = document.querySelector("#destinationInput");
+const visitTypeInput = document.querySelector("#visitTypeInput");
+const fundingSourceInput = document.querySelector("#fundingSourceInput");
+const startDateInput = document.querySelector("#startDateInput");
+const assistantAnswerPanel = document.querySelector("#assistantAnswerPanel");
+const assistantAnswerText = document.querySelector("#assistantAnswerText");
+const assistantSourcesPanel = document.querySelector("#assistantSourcesPanel");
+const assistantSources = document.querySelector("#assistantSources");
+const assistantSourceCount = document.querySelector("#assistantSourceCount");
 
 let searchSessionId = null;
 let canManageIndex = false;
 let currentSortMode = "relevance";
 let currentHits = [];
+let assistantMode = "reimbursement";
 
 function setStatus(message, visible = true) {
   statusBox.hidden = !visible;
@@ -43,6 +66,31 @@ function openResults() {
 function hideResults() {
   resultOverlay.hidden = true;
   resultOverlay.style.display = "none";
+  document.body.style.overflow = "";
+}
+
+function openAssistant(mode) {
+  assistantMode = mode === "overseas" ? "overseas" : "reimbursement";
+  assistantTitle.textContent = assistantMode === "overseas" ? "出国申请助手" : "项目报销助手";
+  assistantQuestionInput.placeholder =
+    assistantMode === "overseas"
+      ? "例如：研究生去日本参加国际会议，出国申请怎么走流程？"
+      : "例如：我的项目产生了一笔差旅费用，应该怎么报销？";
+  reimbursementFields.hidden = assistantMode !== "reimbursement";
+  overseasFields.hidden = assistantMode !== "overseas";
+  assistantAnswerPanel.hidden = true;
+  assistantSourcesPanel.hidden = true;
+  assistantAnswerText.textContent = "";
+  assistantSources.innerHTML = "";
+  assistantOverlay.style.display = "";
+  assistantOverlay.hidden = false;
+  document.body.style.overflow = "hidden";
+  assistantQuestionInput.focus();
+}
+
+function hideAssistant() {
+  assistantOverlay.hidden = true;
+  assistantOverlay.style.display = "none";
   document.body.style.overflow = "";
 }
 
@@ -320,6 +368,84 @@ function renderEvidence(evidence) {
     .join("");
 }
 
+function renderAssistantAnswer(data) {
+  assistantAnswerPanel.hidden = false;
+  assistantAnswerText.textContent = data.answer || "未生成办理建议。";
+  const sources = data.sources || [];
+  assistantSourceCount.textContent = sources.length ? `${sources.length} 条来源` : "未返回来源";
+  if (!sources.length) {
+    assistantSourcesPanel.hidden = true;
+    assistantSources.innerHTML = "";
+    return;
+  }
+  assistantSourcesPanel.hidden = false;
+  assistantSources.innerHTML = sources
+    .map(
+      (source) => `
+        <article class="result-item">
+          <a class="result-title" href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">${escapeHtml(
+            source.title || "未命名来源",
+          )}</a>
+          <div class="meta">
+            <span>${escapeHtml(source.ref || "")}</span>
+            <span>${escapeHtml(source.source_unit || "")}</span>
+            <span>${escapeHtml(source.publish_date || "")}</span>
+            <span>${escapeHtml(source.slot || "")}</span>
+          </div>
+          <p class="snippet">${escapeHtml(source.quote || "")}</p>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+async function runAssistant() {
+  const submitButton = assistantForm.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  assistantAnswerPanel.hidden = false;
+  assistantSourcesPanel.hidden = true;
+  assistantAnswerText.textContent = "正在根据校内事务数据源生成办理建议...";
+  try {
+    const basePayload = {
+      question: assistantQuestionInput.value.trim(),
+      profile: profilePayload(),
+    };
+    const url =
+      assistantMode === "overseas" ? "/api/assistant/overseas" : "/api/assistant/reimbursement";
+    const payload =
+      assistantMode === "overseas"
+        ? {
+            ...basePayload,
+            applicant_type: applicantTypeInput.value || null,
+            destination: destinationInput.value.trim() || null,
+            visit_type: visitTypeInput.value.trim() || null,
+            funding_source: fundingSourceInput.value.trim() || null,
+            start_date: startDateInput.value.trim() || null,
+          }
+        : {
+            ...basePayload,
+            project_name: projectNameInput.value.trim() || null,
+            project_code: projectCodeInput.value.trim() || null,
+            expense_type: expenseTypeInput.value.trim() || null,
+            invoice_date: invoiceDateInput.value.trim() || null,
+            payment_target: paymentTargetInput.value || null,
+          };
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    renderAssistantAnswer(await response.json());
+  } catch (error) {
+    assistantAnswerText.textContent = `生成失败：${error.message}`;
+  } finally {
+    submitButton.disabled = false;
+  }
+}
+
 async function runSearch(query) {
   const submitButton = form.querySelector('button[type="submit"]');
   submitButton.disabled = true;
@@ -384,6 +510,27 @@ sortButtons.forEach((button) => {
   });
 });
 
+document.querySelectorAll("[data-assistant-open]").forEach((button) => {
+  button.addEventListener("click", () => {
+    openAssistant(button.dataset.assistantOpen);
+  });
+});
+
+assistantForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (assistantQuestionInput.value.trim()) {
+    runAssistant();
+  }
+});
+
+closeAssistant.addEventListener("click", hideAssistant);
+
+assistantOverlay.addEventListener("click", (event) => {
+  if (event.target === assistantOverlay) {
+    hideAssistant();
+  }
+});
+
 closeResults.addEventListener("click", hideResults);
 
 resultOverlay.addEventListener("click", (event) => {
@@ -393,7 +540,9 @@ resultOverlay.addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !resultOverlay.hidden) {
+  if (event.key === "Escape" && !assistantOverlay.hidden) {
+    hideAssistant();
+  } else if (event.key === "Escape" && !resultOverlay.hidden) {
     hideResults();
   }
 });
