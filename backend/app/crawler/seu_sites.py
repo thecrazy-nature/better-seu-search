@@ -146,12 +146,18 @@ class PublicSiteCrawler:
         max_pages_per_site: int | None = None,
         delay_seconds: float | None = None,
         sites: list[dict] | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
     ) -> None:
         self.max_pages_per_site = max_pages_per_site or settings.crawl_max_pages_per_site
         self.delay_seconds = settings.crawl_delay_seconds if delay_seconds is None else delay_seconds
         self.max_depth = settings.crawl_max_depth
         self.cutoff_date = date.today() - timedelta(days=settings.crawl_days_back)
         self.sites = [normalized_site_config(site) for site in (sites or configured_seed_sites())]
+        self.progress_callback = progress_callback
+        self.total_target_pages = sum(
+            int(site.get("max_pages") or self.max_pages_per_site)
+            for site in self.sites
+        ) or len(self.sites) or 1
         self.report: dict = {
             "cutoff_date": self.cutoff_date.isoformat(),
             "sites": {},
@@ -233,6 +239,7 @@ class PublicSiteCrawler:
         "hit_page_limit": False,
         }
         self.report["sites"][source] = site_report
+        self._emit_progress(source, site_report, stage="site_started", force=True)
 
         while queue and len(seen) < site_max_pages:
             url, depth = queue.popleft()
@@ -240,6 +247,8 @@ class PublicSiteCrawler:
                 continue
             seen.add(url)
             site_report["visited_count"] = len(seen)
+            if len(seen) == 1 or len(seen) % 10 == 0:
+                self._emit_progress(source, site_report, stage="crawling")
             if self._is_file_url(url):
                 site_report["file_link_count"] += 1
                 continue
@@ -293,7 +302,36 @@ class PublicSiteCrawler:
                 flush=True,
             )
             self.write_report()
+        self._emit_progress(source, site_report, stage="site_completed", force=True)
         return docs
+
+    def _emit_progress(self, source: str, site_report: dict, *, stage: str, force: bool = False) -> None:
+        if self.progress_callback is None:
+            return
+        visited_total = sum(int(item.get("visited_count") or 0) for item in self.report["sites"].values())
+        document_total = sum(int(item.get("document_count") or 0) for item in self.report["sites"].values())
+        progress_total = max(1, int(self.total_target_pages))
+        progress_current = min(progress_total, visited_total)
+        progress_percent = min(0.95, progress_current / progress_total)
+        message = (
+            f"Crawling {source}: visited {site_report.get('visited_count', 0)}/"
+            f"{site_report.get('max_pages', self.max_pages_per_site)} pages, "
+            f"documents {site_report.get('document_count', 0)}"
+        )
+        self.progress_callback(
+            {
+                "phase": "crawling",
+                "stage": stage,
+                "message": message,
+                "current_site": source,
+                "progress_current": progress_current,
+                "progress_total": progress_total,
+                "progress_percent": round(progress_percent, 4),
+                "visited_pages": visited_total,
+                "document_count": document_total,
+                "force": force,
+            }
+        )
 
     def write_report(self) -> None:
         settings.crawl_report_path.parent.mkdir(parents=True, exist_ok=True)

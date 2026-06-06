@@ -23,6 +23,11 @@ const collectionBar = document.querySelector("#collectionRow") || document.creat
 const collectionSelect = document.querySelector("#collectionSelect") || document.createElement("select");
 const collectionMeta = document.querySelector("#collectionMeta") || document.createElement("span");
 const adminLink = document.querySelector("#manageCollectionsLink") || document.createElement("a");
+const crawlProgress = document.createElement("section");
+const crawlProgressTitle = document.createElement("div");
+const crawlProgressTrack = document.createElement("div");
+const crawlProgressFill = document.createElement("div");
+const crawlProgressMeta = document.createElement("div");
 
 let searchSessionId = null;
 let canManageIndex = false;
@@ -75,6 +80,16 @@ if (titleActions && !adminLink.parentElement) {
   collectionBar.appendChild(adminLink);
 }
 
+crawlProgress.className = "crawl-progress";
+crawlProgress.hidden = true;
+crawlProgressTitle.className = "crawl-progress-title";
+crawlProgressTrack.className = "progress-track";
+crawlProgressFill.className = "progress-fill";
+crawlProgressMeta.className = "crawl-progress-meta";
+crawlProgressTrack.appendChild(crawlProgressFill);
+crawlProgress.append(crawlProgressTitle, crawlProgressTrack, crawlProgressMeta);
+statusBox.insertAdjacentElement("afterend", crawlProgress);
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -86,6 +101,32 @@ function escapeHtml(value) {
 function setStatus(message, visible = true) {
   statusBox.hidden = !visible || !message;
   statusBox.textContent = message || "";
+}
+
+function taskProgressPercent(task) {
+  const raw = Number(task?.progress_percent);
+  if (Number.isFinite(raw)) {
+    return Math.max(0, Math.min(1, raw));
+  }
+  if (task?.status === "completed") {
+    return 1;
+  }
+  return 0;
+}
+
+function renderCrawlProgress(task) {
+  const percent = taskProgressPercent(task);
+  const phase = task?.phase || task?.status || "";
+  const current = Number(task?.progress_current || 0);
+  const total = Number(task?.progress_total || 0);
+  crawlProgress.hidden = false;
+  crawlProgress.dataset.state = task?.status || "running";
+  crawlProgressTitle.textContent = task?.message || "Crawl task is running.";
+  crawlProgressFill.style.width = `${Math.round(percent * 100)}%`;
+  crawlProgressMeta.textContent =
+    total > 0
+      ? `${phase} / ${current} of ${total} pages / ${Math.round(percent * 100)}%`
+      : `${phase} / ${Math.round(percent * 100)}%`;
 }
 
 function profilePayload() {
@@ -452,17 +493,23 @@ async function pollCrawlTask(taskId) {
       }
       const task = await response.json();
       if (task.status === "queued") {
+        renderCrawlProgress(task);
         setStatus("\u7d22\u5f15\u66f4\u65b0\u6392\u961f\u4e2d...");
       } else if (task.status === "running") {
-        setStatus("\u6b63\u5728\u540e\u53f0\u66f4\u65b0\u5f53\u524d\u6570\u636e\u5e93\u96c6\uff0c\u4f60\u53ef\u4ee5\u7ee7\u7eed\u641c\u7d22...");
+        renderCrawlProgress(task);
+        setStatus(task.message || "\u6b63\u5728\u540e\u53f0\u66f4\u65b0\u5f53\u524d\u6570\u636e\u5e93\u96c6\uff0c\u4f60\u53ef\u4ee5\u7ee7\u7eed\u641c\u7d22...");
       } else if (task.status === "completed") {
+        renderCrawlProgress(task);
         setStatus(
           `\u7d22\u5f15\u66f4\u65b0\u5b8c\u6210\uff1a\u672c\u6b21\u5199\u5165 ${Number(task.upserted || 0)} \u6761\uff0c\u8be5\u96c6\u5408\u73b0\u5728\u5171\u6709 ${Number(task.total_documents || 0)} \u6761\u6587\u6863\u3002`,
         );
         crawlButton.disabled = false;
         return;
       } else if (task.status === "failed") {
-        setStatus(`\u7d22\u5f15\u66f4\u65b0\u5931\u8d25\uff1a${task.error || "\u672a\u77e5\u9519\u8bef"}`);
+        renderCrawlProgress(task);
+        setStatus(
+          `\u7d22\u5f15\u66f4\u65b0\u5931\u8d25\uff1a${task.message || task.error || "\u672a\u77e5\u9519\u8bef"}`,
+        );
         crawlButton.disabled = false;
         return;
       }

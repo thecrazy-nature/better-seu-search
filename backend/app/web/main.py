@@ -23,6 +23,7 @@ from ..ai.planner import QueryPlanner
 from ..config import ROOT_DIR
 from ..config import settings
 from ..crawl import run_crawl
+from ..embeddings import EmbeddingError
 from ..models import (
     AnswerResult,
     CollectionDetail,
@@ -256,6 +257,17 @@ def admin_collections(request: Request) -> dict:
     _require_local_request(request)
     store.init_db()
     return {"collections": [_collection_detail(item).model_dump() for item in store.list_collections()]}
+
+
+@app.get("/api/admin/crawl-defaults")
+def admin_crawl_defaults(request: Request) -> dict:
+    _require_local_request(request)
+    return {
+        "max_depth": settings.crawl_max_depth,
+        "max_pages": settings.crawl_max_pages_per_site,
+        "days_back": settings.crawl_days_back,
+        "delay_seconds": settings.crawl_delay_seconds,
+    }
 
 
 @app.post("/api/admin/collections")
@@ -499,6 +511,11 @@ def _queue_crawl_task(background_tasks: BackgroundTasks, collection_id: int) -> 
         "task_id": task_id,
         "collection_id": collection_id,
         "status": "queued",
+        "phase": "queued",
+        "message": "Crawl task queued.",
+        "progress_current": 0,
+        "progress_total": 1,
+        "progress_percent": 0.0,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -520,17 +537,52 @@ def crawl_task(task_id: str, request: Request) -> dict:
 def _run_crawl_task(task_id: str) -> None:
     task = crawl_tasks[task_id]
     task["status"] = "running"
+    task["phase"] = "preparing"
+    task["message"] = "Preparing crawl task."
     task["updated_at"] = datetime.now().isoformat(timespec="seconds")
     store.upsert_crawl_task(task)
+
+    def update_progress(payload: dict) -> None:
+        task.update(
+            {
+                "phase": payload.get("phase", task.get("phase")),
+                "message": payload.get("message", task.get("message")),
+                "progress_current": payload.get("progress_current", task.get("progress_current")),
+                "progress_total": payload.get("progress_total", task.get("progress_total")),
+                "progress_percent": payload.get("progress_percent", task.get("progress_percent")),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        store.upsert_crawl_task(task)
+
     try:
         collection_id = task.get("collection_id")
-        upserted = run_crawl(collection_id)
+        upserted = run_crawl(collection_id, progress_callback=update_progress)
         search_cache.clear()
         task.update(
             {
                 "status": "completed",
+                "phase": "completed",
+                "message": "Crawl completed.",
+                "progress_current": task.get("progress_total") or task.get("progress_current") or 1,
+                "progress_percent": 1.0,
                 "upserted": upserted,
                 "total_documents": store.count_documents(collection_id if isinstance(collection_id, int) else None),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        store.upsert_crawl_task(task)
+    except EmbeddingError as exc:
+        task.update(
+            {
+                "status": "failed",
+                "phase": "failed",
+                "error": str(exc),
+                "message": (
+                    "Embedding model is not ready locally. "
+                    "Download the configured model first or switch EMBEDDING_PROVIDER to hash/api."
+                ),
+                "traceback": traceback.format_exc()[-2000:],
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
         )
@@ -539,7 +591,9 @@ def _run_crawl_task(task_id: str) -> None:
         task.update(
             {
                 "status": "failed",
+                "phase": "failed",
                 "error": str(exc),
+                "message": "Crawl task failed.",
                 "traceback": traceback.format_exc()[-2000:],
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
