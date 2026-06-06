@@ -184,6 +184,13 @@ label {
   font-size: 13px;
 }
 
+.field-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .checkbox-row {
   display: flex;
   align-items: center;
@@ -218,6 +225,50 @@ label {
 
 .status {
   color: var(--muted);
+}
+
+.crawl-progress {
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfa;
+}
+
+.crawl-progress-title {
+  margin-bottom: 10px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.crawl-progress-meta {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.progress-track {
+  overflow: hidden;
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: #e6ece8;
+}
+
+.progress-fill {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #0f766e 0%, #24a28a 100%);
+  transition: width 0.25s ease;
+}
+
+.crawl-progress[data-state="failed"] .progress-fill {
+  background: linear-gradient(90deg, #b45309 0%, #d97706 100%);
+}
+
+.crawl-progress[data-state="completed"] .progress-fill {
+  background: linear-gradient(90deg, #0b5f59 0%, #0f766e 100%);
 }
 
 pre {

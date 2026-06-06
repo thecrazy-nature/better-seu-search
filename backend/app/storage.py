@@ -609,8 +609,17 @@ class DocumentStore:
     @staticmethod
     def _ensure_crawl_task_columns(conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(crawl_tasks)").fetchall()}
-        if "collection_id" not in columns:
-            conn.execute("ALTER TABLE crawl_tasks ADD COLUMN collection_id INTEGER")
+        additions = {
+            "collection_id": "ALTER TABLE crawl_tasks ADD COLUMN collection_id INTEGER",
+            "phase": "ALTER TABLE crawl_tasks ADD COLUMN phase TEXT",
+            "message": "ALTER TABLE crawl_tasks ADD COLUMN message TEXT",
+            "progress_current": "ALTER TABLE crawl_tasks ADD COLUMN progress_current INTEGER",
+            "progress_total": "ALTER TABLE crawl_tasks ADD COLUMN progress_total INTEGER",
+            "progress_percent": "ALTER TABLE crawl_tasks ADD COLUMN progress_percent REAL",
+        }
+        for column, sql in additions.items():
+            if column not in columns:
+                conn.execute(sql)
 
     def _ensure_collection_schema(self, conn: sqlite3.Connection) -> None:
         collection_row = conn.execute(
@@ -1394,13 +1403,20 @@ class DocumentStore:
             conn.execute(
                 """
                 INSERT INTO crawl_tasks (
-                    task_id, collection_id, status, created_at, updated_at, upserted,
+                    task_id, collection_id, status, phase, message,
+                    progress_current, progress_total, progress_percent,
+                    created_at, updated_at, upserted,
                     total_documents, error, traceback
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     collection_id = excluded.collection_id,
                     status = excluded.status,
+                    phase = excluded.phase,
+                    message = excluded.message,
+                    progress_current = excluded.progress_current,
+                    progress_total = excluded.progress_total,
+                    progress_percent = excluded.progress_percent,
                     updated_at = excluded.updated_at,
                     upserted = excluded.upserted,
                     total_documents = excluded.total_documents,
@@ -1411,6 +1427,11 @@ class DocumentStore:
                     task["task_id"],
                     task.get("collection_id"),
                     task["status"],
+                    task.get("phase"),
+                    task.get("message"),
+                    task.get("progress_current"),
+                    task.get("progress_total"),
+                    task.get("progress_percent"),
                     task["created_at"],
                     task["updated_at"],
                     task.get("upserted"),
