@@ -6,18 +6,102 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location -LiteralPath $root
+
+function Resolve-Python {
+    $venvPython = Join-Path $root ".venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $venvPython) {
+        return $venvPython
+    }
+
+    $candidates = @(
+        "C:\Python314\python.exe",
+        "C:\Python313\python.exe",
+        "C:\Python312\python.exe",
+        "C:\Users\$env:USERNAME\AppData\Local\Programs\Python\Python314\python.exe",
+        "C:\Users\$env:USERNAME\AppData\Local\Programs\Python\Python313\python.exe",
+        "C:\Users\$env:USERNAME\AppData\Local\Programs\Python\Python312\python.exe"
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return $candidate
+        }
+    }
+
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCommand) {
+        return $pythonCommand.Source
+    }
+
+    $pyCommand = Get-Command py -ErrorAction SilentlyContinue
+    if ($pyCommand) {
+        return $pyCommand.Source
+    }
+
+    throw "Python not found. Install Python or create .venv first."
+}
+
+function Ensure-Venv {
+    param(
+        [string]$BootstrapPython
+    )
+
+    $venvDir = Join-Path $root ".venv"
+    $venvPython = Join-Path $venvDir "Scripts\python.exe"
+    if (Test-Path -LiteralPath $venvPython) {
+        return $venvPython
+    }
+
+    Write-Output "Creating virtual environment..."
+    & $BootstrapPython -m venv $venvDir
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $venvPython)) {
+        throw "Failed to create virtual environment at $venvDir."
+    }
+
+    return $venvPython
+}
+
+function Ensure-Dependencies {
+    param(
+        [string]$VenvPython
+    )
+
+    $requirementsPath = Join-Path $root "backend\requirements.txt"
+    $stampPath = Join-Path $root ".venv\.requirements.sha256"
+    $requirementsHash = (Get-FileHash -LiteralPath $requirementsPath -Algorithm SHA256).Hash
+    $installedHash = ""
+
+    if (Test-Path -LiteralPath $stampPath) {
+        $installedHash = (Get-Content -LiteralPath $stampPath -Raw).Trim()
+    }
+
+    $needInstall = $requirementsHash -ne $installedHash
+    if (-not $needInstall) {
+        & $VenvPython -c "import fastapi, uvicorn, pydantic"
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+        $needInstall = $true
+    }
+
+    Write-Output "Installing Python dependencies..."
+    & $VenvPython -m pip install -r $requirementsPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to install Python dependencies from $requirementsPath."
+    }
+
+    Set-Content -LiteralPath $stampPath -Value $requirementsHash -Encoding ASCII
+}
+
 # Some Codex/Windows shells expose both Path and PATH. PowerShell Start-Process
 # treats environment keys case-insensitively and fails unless the duplicate is removed.
 [Environment]::SetEnvironmentVariable("PATH", $null, "Process")
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location -LiteralPath $root
-
 $netstat = Join-Path $env:SystemRoot "System32\netstat.exe"
-$python = "C:\Users\zj\AppData\Local\Programs\Python\Python312\python.exe"
-if (-not (Test-Path -LiteralPath $python)) {
-    $python = (Get-Command python).Source
-}
+$python = Ensure-Venv (Resolve-Python)
+Ensure-Dependencies $python
 
 $oldPids = & $netstat -ano |
     Select-String ":$Port\s+.*LISTENING\s+(\d+)" |

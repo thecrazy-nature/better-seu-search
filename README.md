@@ -315,3 +315,31 @@ EMBEDDING_MODEL=text-embedding-3-small
 ```powershell
 python -X utf8 -m backend.app.backfill_embeddings --metadata --refresh
 ```
+
+## 一键启动说明
+
+如果只是想在一台新 Windows 设备上把项目跑起来，可以在仓库根目录直接执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start_server.ps1 -Foreground
+```
+
+也可以直接双击根目录的 `start_server.cmd`。
+
+首次启动时，脚本会自动完成这些步骤：
+
+- 查找本机可用的 Python
+- 在项目根目录创建 `.venv`
+- 按 `backend\requirements.txt` 安装或补齐依赖
+- 修复索引元数据并启动服务
+
+启动成功后打开：
+
+```text
+http://127.0.0.1:8000
+```
+
+注意：
+
+- 机器上需要先安装 Python
+- 首次启动需要联网下载依赖，时间会比后续启动更久
