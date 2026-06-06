@@ -60,6 +60,8 @@ class Settings:
         self.extra_seed_sites_json = os.getenv("EXTRA_SEED_SITES_JSON", "").strip()
         db_path = os.getenv("SEU_SEARCH_DB", "backend/data/seu_search.sqlite3")
         self.db_path = (ROOT_DIR / db_path).resolve()
+        assistant_db_path = os.getenv("SEU_ASSISTANT_DB", "backend/data/campus_assistant.sqlite3")
+        self.assistant_db_path = (ROOT_DIR / assistant_db_path).resolve()
         report_path = os.getenv("SEU_CRAWL_REPORT", "backend/data/crawl_report.json")
         self.crawl_report_path = (ROOT_DIR / report_path).resolve()
 
