@@ -1,7 +1,8 @@
 param(
     [int]$Port = 8000,
     [switch]$SeedDemo,
-    [switch]$Foreground
+    [switch]$Foreground,
+    [switch]$Lan
 )
 
 $ErrorActionPreference = "Stop"
@@ -95,6 +96,53 @@ function Ensure-Dependencies {
     Set-Content -LiteralPath $stampPath -Value $requirementsHash -Encoding ASCII
 }
 
+function Ensure-LanFirewallRule {
+    param(
+        [int]$Port
+    )
+
+    try {
+        $ruleName = "SEU Search LAN $Port"
+        $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+
+        if ($existingRule) {
+            Set-NetFirewallRule -DisplayName $ruleName -Enabled True -Direction Inbound -Action Allow -Profile Private,Public -ErrorAction Stop | Out-Null
+            Set-NetFirewallAddressFilter -AssociatedNetFirewallRule $existingRule -RemoteAddress LocalSubnet -ErrorAction Stop | Out-Null
+            Set-NetFirewallPortFilter -AssociatedNetFirewallRule $existingRule -Protocol TCP -LocalPort $Port -ErrorAction Stop | Out-Null
+            return
+        }
+
+        New-NetFirewallRule `
+            -DisplayName $ruleName `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort $Port `
+            -Profile Private,Public `
+            -RemoteAddress LocalSubnet `
+            -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Write-Warning "Could not create Windows Firewall rule automatically. Run PowerShell as Administrator once, or allow inbound TCP $Port manually for local subnet access."
+    }
+}
+
+function Get-LanAccessUrls {
+    param(
+        [int]$Port
+    )
+
+    $urls = [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+        Where-Object {
+            $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
+            -not $_.IPAddressToString.StartsWith("127.")
+        } |
+        ForEach-Object { "http://$($_.IPAddressToString):$Port/" } |
+        Sort-Object -Unique
+
+    return @($urls)
+}
+
 # Some Codex/Windows shells expose both Path and PATH. PowerShell Start-Process
 # treats environment keys case-insensitively and fails unless the duplicate is removed.
 [Environment]::SetEnvironmentVariable("PATH", $null, "Process")
@@ -102,6 +150,14 @@ function Ensure-Dependencies {
 $netstat = Join-Path $env:SystemRoot "System32\netstat.exe"
 $python = Ensure-Venv (Resolve-Python)
 Ensure-Dependencies $python
+$bindHost = if ($Lan) { "0.0.0.0" } else { "127.0.0.1" }
+$localUrl = "http://127.0.0.1:$Port/"
+$healthUrl = "http://127.0.0.1:$Port/api/health"
+$lanUrls = if ($Lan) { Get-LanAccessUrls -Port $Port } else { @() }
+
+if ($Lan) {
+    Ensure-LanFirewallRule -Port $Port
+}
 
 $oldPids = & $netstat -ano |
     Select-String ":$Port\s+.*LISTENING\s+(\d+)" |
@@ -121,10 +177,16 @@ if ($SeedDemo) {
     & $python -m backend.app.seed_demo
 }
 
-$uvicornArgs = @("-m", "uvicorn", "backend.app.web.main:app", "--host", "127.0.0.1", "--port", "$Port")
+$uvicornArgs = @("-m", "uvicorn", "backend.app.web.main:app", "--host", $bindHost, "--port", "$Port")
 
 if ($Foreground) {
-    Write-Output "SEU Search server starting: http://127.0.0.1:$Port/"
+    Write-Output "SEU Search server starting: $localUrl"
+    if ($Lan) {
+        Write-Output "LAN mode enabled. Remote devices can search, but index management stays local-only."
+        foreach ($url in $lanUrls) {
+            Write-Output "LAN access: $url"
+        }
+    }
     Write-Output "Press Ctrl+C to stop the server."
     & $python @uvicornArgs
     exit $LASTEXITCODE
@@ -147,7 +209,7 @@ $proc = Start-Process `
 $health = $null
 for ($i = 0; $i -lt 20; $i++) {
     try {
-        $health = Invoke-RestMethod "http://127.0.0.1:$Port/api/health" -TimeoutSec 3
+        $health = Invoke-RestMethod $healthUrl -TimeoutSec 3
         break
     }
     catch {
@@ -160,9 +222,15 @@ if (-not $health) {
     if (Test-Path -LiteralPath $err) {
         Get-Content -LiteralPath $err -Tail 40
     }
-    throw "Failed to start server on http://127.0.0.1:$Port/"
+    throw "Failed to start server on $localUrl"
 }
 
-Write-Output "SEU Search server started: http://127.0.0.1:$Port/"
+Write-Output "SEU Search server started: $localUrl"
+if ($Lan) {
+    Write-Output "LAN mode enabled. Remote devices can search, but index management stays local-only."
+    foreach ($url in $lanUrls) {
+        Write-Output "LAN access: $url"
+    }
+}
 Write-Output "PID: $($proc.Id)"
 Write-Output "Documents: $($health.documents), chunks: $($health.chunks)"

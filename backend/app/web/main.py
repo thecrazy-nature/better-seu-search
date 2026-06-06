@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
+import socket
 import traceback
 import uuid
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +30,7 @@ from ..storage import DocumentStore
 
 FRONTEND_DIR = ROOT_DIR / "frontend"
 STATIC_DIR = FRONTEND_DIR / "static"
+LOCAL_ONLY_MESSAGE = "This endpoint is available only from the local machine."
 
 
 class SearchRequest(BaseModel):
@@ -55,6 +58,12 @@ class CrawlTaskResponse(BaseModel):
     status: str
 
 
+class ClientAccess(BaseModel):
+    is_local_client: bool
+    can_search: bool = True
+    can_manage_index: bool = False
+
+
 store = DocumentStore()
 planner = QueryPlanner()
 engine = SearchEngine(store)
@@ -64,6 +73,80 @@ SEARCH_CACHE_MAX = 128
 search_cache: OrderedDict[str, SearchResponse] = OrderedDict()
 crawl_tasks: dict[str, dict] = {}
 search_sessions: dict[str, dict] = {}
+
+
+def _normalize_host(host: str | None) -> str:
+    if not host:
+        return ""
+    normalized = host.strip().lower().strip("[]")
+    if "%" in normalized:
+        normalized = normalized.split("%", 1)[0]
+    return normalized
+
+
+def _discover_local_client_hosts() -> set[str]:
+    hosts = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"}
+    hostnames = {socket.gethostname(), socket.getfqdn(), "localhost"}
+
+    for hostname in hostnames:
+        if not hostname:
+            continue
+        hosts.add(hostname)
+        try:
+            resolved = socket.gethostbyname_ex(hostname)[2]
+        except OSError:
+            resolved = []
+        for value in resolved:
+            hosts.add(value)
+            hosts.add(f"::ffff:{value}")
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+        except OSError:
+            infos = []
+        for _, _, _, _, sockaddr in infos:
+            if not sockaddr:
+                continue
+            value = sockaddr[0]
+            hosts.add(value)
+            if ":" not in value:
+                hosts.add(f"::ffff:{value}")
+
+    return {_normalize_host(value) for value in hosts if value}
+
+
+LOCAL_CLIENT_HOSTS = _discover_local_client_hosts()
+
+
+def _is_local_host(host: str | None) -> bool:
+    normalized = _normalize_host(host)
+    if not normalized:
+        return False
+    if normalized in LOCAL_CLIENT_HOSTS:
+        return True
+    if normalized.startswith("::ffff:"):
+        return _is_local_host(normalized.removeprefix("::ffff:"))
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return normalized == "localhost"
+
+
+def _is_local_request(request: Request) -> bool:
+    client = request.client
+    return _is_local_host(client.host if client else None)
+
+
+def _client_access(request: Request) -> ClientAccess:
+    is_local_client = _is_local_request(request)
+    return ClientAccess(
+        is_local_client=is_local_client,
+        can_manage_index=is_local_client,
+    )
+
+
+def _require_local_request(request: Request) -> None:
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail=LOCAL_ONLY_MESSAGE)
 
 app = FastAPI(title="SEU Official Search MVP", version="0.1.0")
 app.add_middleware(
@@ -89,11 +172,12 @@ def index() -> FileResponse:
 
 
 @app.get("/api/health")
-def health() -> dict:
+def health(request: Request) -> dict:
     store.init_db()
     return {
         "ok": True,
         **store.get_index_stats(),
+        "access": _client_access(request).model_dump(),
     }
 
 
@@ -187,7 +271,8 @@ def _search_cache_key(payload: SearchRequest) -> str:
 
 
 @app.post("/api/crawl", response_model=CrawlTaskResponse)
-def crawl(background_tasks: BackgroundTasks) -> CrawlTaskResponse:
+def crawl(background_tasks: BackgroundTasks, request: Request) -> CrawlTaskResponse:
+    _require_local_request(request)
     task_id = uuid.uuid4().hex
     task = {
         "task_id": task_id,
@@ -202,7 +287,8 @@ def crawl(background_tasks: BackgroundTasks) -> CrawlTaskResponse:
 
 
 @app.get("/api/crawl/tasks/{task_id}")
-def crawl_task(task_id: str) -> dict:
+def crawl_task(task_id: str, request: Request) -> dict:
+    _require_local_request(request)
     task = crawl_tasks.get(task_id) or store.get_crawl_task(task_id)
     if not task:
         return {"error": "not_found"}
@@ -239,7 +325,8 @@ def _run_crawl_task(task_id: str) -> None:
 
 
 @app.get("/api/crawl/report")
-def crawl_report() -> dict:
+def crawl_report(request: Request) -> dict:
+    _require_local_request(request)
     if not settings.crawl_report_path.exists():
         return {"exists": False, "message": "No crawl report generated yet."}
     return {
@@ -250,7 +337,8 @@ def crawl_report() -> dict:
 
 
 @app.get("/api/documents/{doc_id}")
-def document(doc_id: int) -> dict:
+def document(doc_id: int, request: Request) -> dict:
+    _require_local_request(request)
     row = store.get_document(doc_id)
     if not row:
         return {"error": "not_found"}

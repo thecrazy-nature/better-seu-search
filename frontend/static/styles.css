@@ -70,6 +70,12 @@ p {
   line-height: 1.6;
 }
 
+.access-hint {
+  margin: 10px 0 0;
+  color: #7c5c10;
+  font-size: 14px;
+}
+
 .search-form {
   display: grid;
   gap: 14px;

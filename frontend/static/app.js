@@ -17,12 +17,40 @@ const judgeList = document.querySelector("#judgeList");
 const resultsPanel = document.querySelector("#resultsPanel");
 const results = document.querySelector("#results");
 const crawlButton = document.querySelector("#crawlButton");
+const accessHint = document.createElement("p");
+const titleBlock = document.querySelector(".title-row > div");
 let searchSessionId = null;
+let canManageIndex = false;
+
+accessHint.className = "access-hint";
+accessHint.hidden = true;
+titleBlock?.appendChild(accessHint);
+crawlButton.hidden = true;
 
 function setStatus(message, visible = true) {
   statusBox.hidden = !visible;
   statusBox.textContent = message;
 }
+
+function applyAccess(access) {
+  canManageIndex = Boolean(access?.can_manage_index);
+  crawlButton.hidden = !canManageIndex;
+  accessHint.hidden = canManageIndex;
+  accessHint.textContent = canManageIndex
+    ? ""
+    : "\u5c40\u57df\u7f51\u8bbf\u5ba2\u6a21\u5f0f\uff1a\u4ec5\u652f\u6301\u641c\u7d22\u4e0e\u67e5\u770b\u7ed3\u679c\uff0c\u4e0d\u53ef\u66f4\u65b0\u7d22\u5f15\u3002";
+}
+
+function refreshAccess() {
+  fetch("/api/health")
+    .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+    .then((data) => {
+      applyAccess(data.access || {});
+    })
+    .catch(() => {});
+}
+
+refreshAccess();
 
 function profilePayload() {
   return {
@@ -258,6 +286,10 @@ document.querySelectorAll("[data-query]").forEach((button) => {
 });
 
 crawlButton.addEventListener("click", async () => {
+  if (!canManageIndex) {
+    setStatus("\u5c40\u57df\u7f51\u8bbf\u5ba2\u6a21\u5f0f\u4e0b\u4ec5\u652f\u6301\u641c\u7d22\uff0c\u4e0d\u80fd\u66f4\u65b0\u7d22\u5f15\u3002");
+    return;
+  }
   crawlButton.disabled = true;
   setStatus("索引更新任务已提交，正在等待后台开始...");
   try {
