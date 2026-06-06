@@ -17,6 +17,26 @@ const judgeList = document.querySelector("#judgeList");
 const resultsPanel = document.querySelector("#resultsPanel");
 const results = document.querySelector("#results");
 const crawlButton = document.querySelector("#crawlButton");
+const assistantForm = document.querySelector("#assistantForm");
+const assistantModeInput = document.querySelector("#assistantModeInput");
+const assistantQuestionInput = document.querySelector("#assistantQuestionInput");
+const reimbursementFields = document.querySelector("#reimbursementFields");
+const overseasFields = document.querySelector("#overseasFields");
+const projectNameInput = document.querySelector("#projectNameInput");
+const projectCodeInput = document.querySelector("#projectCodeInput");
+const expenseTypeInput = document.querySelector("#expenseTypeInput");
+const invoiceDateInput = document.querySelector("#invoiceDateInput");
+const paymentTargetInput = document.querySelector("#paymentTargetInput");
+const applicantTypeInput = document.querySelector("#applicantTypeInput");
+const destinationInput = document.querySelector("#destinationInput");
+const visitTypeInput = document.querySelector("#visitTypeInput");
+const fundingSourceInput = document.querySelector("#fundingSourceInput");
+const startDateInput = document.querySelector("#startDateInput");
+const assistantAnswerPanel = document.querySelector("#assistantAnswerPanel");
+const assistantAnswerTitle = document.querySelector("#assistantAnswerTitle");
+const assistantAnswerText = document.querySelector("#assistantAnswerText");
+const assistantSourcesPanel = document.querySelector("#assistantSourcesPanel");
+const assistantSources = document.querySelector("#assistantSources");
 let searchSessionId = null;
 
 function setStatus(message, visible = true) {
@@ -43,6 +63,45 @@ function escapeHtml(value) {
 function renderAnswer(value) {
   const escaped = escapeHtml(value);
   answerText.innerHTML = escaped.replace(/\*\*(.+?)\*\*/gs, "<strong>$1</strong>");
+}
+
+function renderAssistantAnswer(value) {
+  const escaped = escapeHtml(value);
+  assistantAnswerText.innerHTML = escaped.replace(/\*\*(.+?)\*\*/gs, "<strong>$1</strong>");
+}
+
+function renderAssistantSources(sources) {
+  if (!sources || !sources.length) {
+    assistantSources.innerHTML = '<p class="empty">没有可展示的独立事务数据源。</p>';
+    return;
+  }
+  assistantSources.innerHTML = sources
+    .map((source) => {
+      const tags = [source.source_unit, source.publish_date, source.slot]
+        .filter(Boolean)
+        .map((item) => `<span class="tag">${escapeHtml(item)}</span>`)
+        .join("");
+      return `
+        <article class="result-item">
+          <a class="result-title" href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">${escapeHtml(
+            source.title,
+          )}</a>
+          <div class="meta">${tags}</div>
+          <p class="snippet">${escapeHtml(source.quote || "")}</p>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function syncAssistantMode() {
+  const isOverseas = assistantModeInput.value === "overseas";
+  reimbursementFields.hidden = isOverseas;
+  overseasFields.hidden = !isOverseas;
+  assistantQuestionInput.placeholder = isOverseas
+    ? "例如：我是研究生，要去日本参加国际会议，如何申请？"
+    : "例如：我的项目xxx产生了一笔差旅费用，如何报销？";
+  assistantAnswerTitle.textContent = isOverseas ? "出国申请建议" : "报销办理建议";
 }
 
 function renderResults(hits) {
@@ -249,6 +308,61 @@ form.addEventListener("submit", (event) => {
   const query = queryInput.value.trim();
   if (query) runSearch(query);
 });
+
+assistantForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const question = assistantQuestionInput.value.trim();
+  if (!question) return;
+  const mode = assistantModeInput.value;
+  const submitButton = assistantForm.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  setStatus("正在使用独立校内事务数据集生成办理流程...");
+  try {
+    const endpoint =
+      mode === "overseas" ? "/api/assistant/overseas-application" : "/api/assistant/reimbursement";
+    const payload =
+      mode === "overseas"
+        ? {
+            question,
+            applicant_type: applicantTypeInput.value || null,
+            destination: destinationInput.value.trim() || null,
+            visit_type: visitTypeInput.value.trim() || null,
+            funding_source: fundingSourceInput.value.trim() || null,
+            start_date: startDateInput.value.trim() || null,
+            profile: profilePayload(),
+          }
+        : {
+            question,
+            project_name: projectNameInput.value.trim() || null,
+            project_code: projectCodeInput.value.trim() || null,
+            expense_type: expenseTypeInput.value.trim() || null,
+            invoice_date: invoiceDateInput.value.trim() || null,
+            payment_target: paymentTargetInput.value || null,
+            profile: profilePayload(),
+          };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const data = await response.json();
+    renderAssistantAnswer(data.answer);
+    renderAssistantSources(data.sources);
+    assistantAnswerPanel.hidden = false;
+    assistantSourcesPanel.hidden = false;
+    setStatus(`已生成${mode === "overseas" ? "出国申请" : "报销"}流程；数据集：${data.dataset}，来源 ${data.sources.length} 条。`);
+  } catch (error) {
+    setStatus(`私人助理生成失败：${error.message}`);
+  } finally {
+    submitButton.disabled = false;
+  }
+});
+
+assistantModeInput.addEventListener("change", syncAssistantMode);
+syncAssistantMode();
 
 document.querySelectorAll("[data-query]").forEach((button) => {
   button.addEventListener("click", () => {

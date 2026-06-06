@@ -61,6 +61,100 @@
 
       <section id="status" class="status" hidden></section>
 
+      <section class="assistant-panel">
+        <div class="title-row">
+          <div>
+            <h2>校内私人助理</h2>
+            <p>使用独立事务数据集，只引用东南大学及其下属机构官方网站来源，生成材料、流程、人物、地点和风险提醒。</p>
+          </div>
+        </div>
+
+        <form id="assistantForm" class="search-form">
+          <div class="assistant-mode-row">
+            <label>
+              助手类型
+              <select id="assistantModeInput">
+                <option value="reimbursement">项目报销</option>
+                <option value="overseas">出国申请</option>
+              </select>
+            </label>
+          </div>
+          <div class="query-row">
+            <input
+              id="assistantQuestionInput"
+              name="assistantQuestion"
+              placeholder="例如：我的项目xxx产生了一笔差旅费用，如何报销？"
+              autocomplete="off"
+              required
+            />
+            <button type="submit">生成流程</button>
+          </div>
+          <div id="reimbursementFields" class="assistant-grid">
+            <label>
+              项目名称
+              <input id="projectNameInput" placeholder="可选，例如 xxx" />
+            </label>
+            <label>
+              项目号/经费号
+              <input id="projectCodeInput" placeholder="可选，例如 6xxxxxxx" />
+            </label>
+            <label>
+              费用类型
+              <input id="expenseTypeInput" placeholder="差旅 / 材料 / 设备 / 版面费" />
+            </label>
+            <label>
+              发票日期
+              <input id="invoiceDateInput" placeholder="YYYY-MM-DD" />
+            </label>
+            <label>
+              付款对象
+              <select id="paymentTargetInput">
+                <option value="">暂不确定</option>
+                <option value="个人">个人</option>
+                <option value="单位">单位</option>
+              </select>
+            </label>
+          </div>
+          <div id="overseasFields" class="assistant-grid" hidden>
+            <label>
+              申请人身份
+              <select id="applicantTypeInput">
+                <option value="">暂不确定</option>
+                <option value="本科生">本科生</option>
+                <option value="研究生">研究生</option>
+                <option value="教师">教师</option>
+              </select>
+            </label>
+            <label>
+              目的地
+              <input id="destinationInput" placeholder="例如 日本 / 港澳 / 美国" />
+            </label>
+            <label>
+              出访类型
+              <input id="visitTypeInput" placeholder="国际会议 / 交换 / 访学 / CSC" />
+            </label>
+            <label>
+              经费来源
+              <input id="fundingSourceInput" placeholder="自费 / 公费 / 导师科研项目" />
+            </label>
+            <label>
+              计划出发日期
+              <input id="startDateInput" placeholder="YYYY-MM-DD" />
+            </label>
+          </div>
+        </form>
+      </section>
+
+      <section id="assistantAnswerPanel" class="answer-panel" hidden>
+        <h2 id="assistantAnswerTitle">办理建议</h2>
+        <div id="assistantAnswerText" class="answer-text"></div>
+      </section>
+
+      <section id="assistantSourcesPanel" class="results-panel" hidden>
+        <h2>私人助理数据源</h2>
+        <div id="assistantSources"></div>
+      </section>
+
       <section id="planPanel" class="plan-panel" hidden>
         <h2>AI 检索规划</h2>
         <pre id="planJson"></pre>

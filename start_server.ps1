@@ -1,22 +1,45 @@
 param(
     [int]$Port = 8000,
     [switch]$SeedDemo,
-    [switch]$Foreground
+    [switch]$Foreground,
+    [ValidateSet("hash", "local", "api")]
+    [string]$EmbeddingProvider = "hash"
 )
 
 $ErrorActionPreference = "Stop"
 
-# Some Codex/Windows shells expose both Path and PATH. PowerShell Start-Process
-# treats environment keys case-insensitively and fails unless the duplicate is removed.
-[Environment]::SetEnvironmentVariable("PATH", $null, "Process")
-
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $root
+$env:EMBEDDING_PROVIDER = $EmbeddingProvider
 
 $netstat = Join-Path $env:SystemRoot "System32\netstat.exe"
-$python = "C:\Users\zj\AppData\Local\Programs\Python\Python312\python.exe"
-if (-not (Test-Path -LiteralPath $python)) {
-    $python = (Get-Command python).Source
+$python = $null
+$searchingPython = "D:\Documents\conda\conda_envs\searching\python.exe"
+if (Test-Path -LiteralPath $searchingPython) {
+    $python = $searchingPython
+}
+
+$conda = Get-Command conda -ErrorAction SilentlyContinue
+if (-not $python -and $conda) {
+    try {
+        $condaPython = & $conda.Source run -n searching python -c "import sys; print(sys.executable)"
+        if ($LASTEXITCODE -eq 0 -and $condaPython -and (Test-Path -LiteralPath $condaPython.Trim())) {
+            $python = $condaPython.Trim()
+        }
+    }
+    catch {
+        $python = $null
+    }
+}
+
+if (-not $python) {
+    $legacyPython = "C:\Users\zj\AppData\Local\Programs\Python\Python312\python.exe"
+    if (Test-Path -LiteralPath $legacyPython) {
+        $python = $legacyPython
+    }
+    else {
+        $python = (Get-Command python).Source
+    }
 }
 
 $oldPids = & $netstat -ano |
@@ -48,17 +71,13 @@ if ($Foreground) {
 
 $logDir = Join-Path $root "backend\data"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-$out = Join-Path $logDir "server.log"
-$err = Join-Path $logDir "server.err.log"
 
-$proc = Start-Process `
-    -FilePath $python `
-    -ArgumentList $uvicornArgs `
+$cmdLine = "set EMBEDDING_PROVIDER=$EmbeddingProvider&& start ""SEU Search Server"" /D ""$root"" /MIN ""$python"" -m uvicorn backend.app.web.main:app --host 127.0.0.1 --port $Port"
+Start-Process `
+    -FilePath $env:ComSpec `
+    -ArgumentList @("/c", $cmdLine) `
     -WorkingDirectory $root `
-    -RedirectStandardOutput $out `
-    -RedirectStandardError $err `
-    -WindowStyle Hidden `
-    -PassThru
+    -WindowStyle Hidden | Out-Null
 
 $health = $null
 for ($i = 0; $i -lt 20; $i++) {
@@ -72,13 +91,15 @@ for ($i = 0; $i -lt 20; $i++) {
 }
 
 if (-not $health) {
-    Write-Output "Server did not pass health check. Last stderr lines:"
-    if (Test-Path -LiteralPath $err) {
-        Get-Content -LiteralPath $err -Tail 40
-    }
     throw "Failed to start server on http://127.0.0.1:$Port/"
 }
 
 Write-Output "SEU Search server started: http://127.0.0.1:$Port/"
-Write-Output "PID: $($proc.Id)"
+$serverPids = & $netstat -ano |
+    Select-String ":$Port\s+.*LISTENING\s+(\d+)" |
+    ForEach-Object { [regex]::Match($_.Line, "LISTENING\s+(\d+)").Groups[1].Value } |
+    Select-Object -Unique
+if ($serverPids) {
+    Write-Output "PID: $($serverPids -join ', ')"
+}
 Write-Output "Documents: $($health.documents), chunks: $($health.chunks)"

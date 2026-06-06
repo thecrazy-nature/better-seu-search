@@ -18,6 +18,13 @@ from ..ai.answerer import Answerer
 from ..ai.evidence_judge import AIEvidenceJudge
 from ..ai.evidence_judge import EvidenceJudgeReport
 from ..ai.planner import QueryPlanner
+from ..campus_assistant import CampusAssistantStore
+from ..campus_assistant import OverseasApplicationAssistant
+from ..campus_assistant import OverseasApplicationRequest
+from ..campus_assistant import OverseasApplicationResponse
+from ..campus_assistant import ReimbursementAssistant
+from ..campus_assistant import ReimbursementRequest
+from ..campus_assistant import ReimbursementResponse
 from ..config import ROOT_DIR
 from ..config import settings
 from ..crawl import run_crawl
@@ -56,10 +63,13 @@ class CrawlTaskResponse(BaseModel):
 
 
 store = DocumentStore()
+assistant_store = CampusAssistantStore()
 planner = QueryPlanner()
 engine = SearchEngine(store)
 answerer = Answerer()
 evidence_judge = AIEvidenceJudge()
+reimbursement_assistant = ReimbursementAssistant(assistant_store)
+overseas_application_assistant = OverseasApplicationAssistant(assistant_store)
 SEARCH_CACHE_MAX = 128
 search_cache: OrderedDict[str, SearchResponse] = OrderedDict()
 crawl_tasks: dict[str, dict] = {}
@@ -81,6 +91,7 @@ if STATIC_DIR.exists():
 @app.on_event("startup")
 def startup() -> None:
     store.init_db()
+    assistant_store.init_db()
 
 
 @app.get("/")
@@ -95,6 +106,22 @@ def health() -> dict:
         "ok": True,
         **store.get_index_stats(),
     }
+
+
+@app.get("/api/assistant/health")
+def assistant_health() -> dict:
+    assistant_store.init_db()
+    return {"ok": True, **assistant_store.stats()}
+
+
+@app.post("/api/assistant/reimbursement", response_model=ReimbursementResponse)
+def assistant_reimbursement(payload: ReimbursementRequest) -> ReimbursementResponse:
+    return reimbursement_assistant.answer(payload)
+
+
+@app.post("/api/assistant/overseas-application", response_model=OverseasApplicationResponse)
+def assistant_overseas_application(payload: OverseasApplicationRequest) -> OverseasApplicationResponse:
+    return overseas_application_assistant.answer(payload)
 
 
 @app.post("/api/search", response_model=SearchResponse)

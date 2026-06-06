@@ -15,6 +15,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -29,6 +33,7 @@ body {
 }
 
 .search-panel,
+.assistant-panel,
 .plan-panel,
 .answer-panel,
 .evidence-panel,
@@ -73,6 +78,14 @@ p {
 .search-form {
   display: grid;
   gap: 14px;
+}
+
+.assistant-panel {
+  margin-top: 16px;
+}
+
+.assistant-mode-row {
+  width: min(260px, 100%);
 }
 
 .query-row {
@@ -130,6 +143,12 @@ button:disabled {
 .profile-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.assistant-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
   gap: 12px;
 }
 
@@ -351,7 +370,8 @@ mark {
 
   .title-row,
   .query-row,
-  .profile-grid {
+  .profile-grid,
+  .assistant-grid {
     grid-template-columns: 1fr;
     display: grid;
   }
