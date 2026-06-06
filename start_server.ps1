@@ -1,105 +1,224 @@
 param(
     [int]$Port = 8000,
-    [switch]$SeedDemo,
     [switch]$Foreground,
-    [ValidateSet("hash", "local", "api")]
-    [string]$EmbeddingProvider = "hash"
+    [switch]$Lan,
+    [string]$EmbeddingProvider = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location -LiteralPath $root
-$env:EMBEDDING_PROVIDER = $EmbeddingProvider
+$venvDir = Join-Path $root ".venv"
+$venvPython = Join-Path $venvDir "Scripts\python.exe"
+$requirementsPath = Join-Path $root "backend\requirements.txt"
+$hostAddress = if ($Lan) { "0.0.0.0" } else { "127.0.0.1" }
 
-$netstat = Join-Path $env:SystemRoot "System32\netstat.exe"
-$python = $null
-$searchingPython = "D:\Documents\conda\conda_envs\searching\python.exe"
-if (Test-Path -LiteralPath $searchingPython) {
-    $python = $searchingPython
-}
+function Resolve-Python {
+    if (Test-Path $venvPython) {
+        return $venvPython
+    }
 
-$conda = Get-Command conda -ErrorAction SilentlyContinue
-if (-not $python -and $conda) {
+    $candidates = @(
+        "C:\Python314\python.exe",
+        "C:\Python313\python.exe",
+        "C:\Python312\python.exe",
+        "C:\Python311\python.exe",
+        "C:\Python310\python.exe"
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            return $candidate
+        }
+    }
+
     try {
-        $condaPython = & $conda.Source run -n searching python -c "import sys; print(sys.executable)"
-        if ($LASTEXITCODE -eq 0 -and $condaPython -and (Test-Path -LiteralPath $condaPython.Trim())) {
-            $python = $condaPython.Trim()
+        $python = (Get-Command python -ErrorAction Stop).Source
+        if ($python) {
+            return $python
         }
     }
     catch {
-        $python = $null
     }
+
+    try {
+        $py = (Get-Command py -ErrorAction Stop).Source
+        if ($py) {
+            return "$py -3"
+        }
+    }
+    catch {
+    }
+
+    throw "Python was not found. Install Python first, then run this script again."
 }
 
-if (-not $python) {
-    $legacyPython = "C:\Users\zj\AppData\Local\Programs\Python\Python312\python.exe"
-    if (Test-Path -LiteralPath $legacyPython) {
-        $python = $legacyPython
+function Invoke-PythonCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PythonCommand,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    if ($PythonCommand.Contains(" ")) {
+        $segments = $PythonCommand.Split(" ", 2)
+        & $segments[0] $segments[1] @Arguments
     }
     else {
-        $python = (Get-Command python).Source
+        & $PythonCommand @Arguments
     }
 }
 
-$oldPids = & $netstat -ano |
-    Select-String ":$Port\s+.*LISTENING\s+(\d+)" |
-    ForEach-Object { [regex]::Match($_.Line, "LISTENING\s+(\d+)").Groups[1].Value } |
-    Select-Object -Unique
+function Ensure-Venv {
+    param([string]$BootstrapPython)
 
-foreach ($pidText in $oldPids) {
-    if ($pidText) {
-        Stop-Process -Id ([int]$pidText) -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path $venvPython)) {
+        Write-Output "Creating .venv ..."
+        Invoke-PythonCommand -PythonCommand $BootstrapPython -Arguments @("-m", "venv", $venvDir)
     }
 }
 
-Write-Output "Repairing index metadata..."
-& $python -m backend.app.repair_index_metadata
+function Ensure-Dependencies {
+    if (-not (Test-Path $requirementsPath)) {
+        return
+    }
 
-if ($SeedDemo) {
-    & $python -m backend.app.seed_demo
+    $marker = Join-Path $venvDir ".deps_ready"
+    $needsInstall = -not (Test-Path $marker)
+    if (-not $needsInstall) {
+        $markerTime = (Get-Item $marker).LastWriteTimeUtc
+        $requirementsTime = (Get-Item $requirementsPath).LastWriteTimeUtc
+        $needsInstall = $requirementsTime -gt $markerTime
+    }
+
+    if ($needsInstall) {
+        Write-Output "Installing backend dependencies ..."
+        & $venvPython -m pip install --upgrade pip
+        & $venvPython -m pip install -r $requirementsPath
+        Set-Content -Path $marker -Value (Get-Date).ToString("s")
+    }
 }
 
-$uvicornArgs = @("-m", "uvicorn", "backend.app.web.main:app", "--host", "127.0.0.1", "--port", "$Port")
+function Ensure-FirewallRule {
+    param([int]$RulePort)
+
+    if (-not $Lan) {
+        return
+    }
+
+    try {
+        $existing = Get-NetFirewallRule -DisplayName "SEU Search LAN $RulePort" -ErrorAction SilentlyContinue
+        if (-not $existing) {
+            New-NetFirewallRule `
+                -DisplayName "SEU Search LAN $RulePort" `
+                -Direction Inbound `
+                -Action Allow `
+                -Protocol TCP `
+                -LocalPort $RulePort `
+                -Profile Private,Public `
+                -RemoteAddress LocalSubnet `
+                | Out-Null
+        }
+    }
+    catch {
+        Write-Output "Firewall rule was not added automatically. If remote devices still cannot connect, run this script as Administrator once."
+    }
+}
+
+function Get-LanAddresses {
+    $addresses = @()
+    try {
+        $addresses = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object {
+                $_.IPAddress -notlike "127.*" -and
+                $_.IPAddress -notlike "169.254.*" -and
+                $_.PrefixOrigin -ne "WellKnown"
+            } |
+            Select-Object -ExpandProperty IPAddress -Unique
+    }
+    catch {
+        try {
+            $addresses = [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+                Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
+                ForEach-Object { $_.IPAddressToString } |
+                Where-Object { $_ -notlike "127.*" -and $_ -notlike "169.254.*" } |
+                Select-Object -Unique
+        }
+        catch {
+            $addresses = @()
+        }
+    }
+    return @($addresses)
+}
+
+$bootstrapPython = Resolve-Python
+Ensure-Venv -BootstrapPython $bootstrapPython
+Ensure-Dependencies
+Ensure-FirewallRule -RulePort $Port
+
+if (-not $EmbeddingProvider) {
+    $EmbeddingProvider = $env:EMBEDDING_PROVIDER
+}
+
+$uvicornArgs = @("-m", "uvicorn", "backend.app.web.main:app", "--host", $hostAddress, "--port", "$Port")
 
 if ($Foreground) {
-    Write-Output "SEU Search server starting: http://127.0.0.1:$Port/"
-    Write-Output "Press Ctrl+C to stop the server."
-    & $python @uvicornArgs
+    $env:EMBEDDING_PROVIDER = $EmbeddingProvider
+    if ($Lan) {
+        Write-Output "LAN mode enabled. Remote devices can search, but index management stays local-only."
+        foreach ($ip in (Get-LanAddresses)) {
+            Write-Output ("LAN access: http://{0}:{1}/" -f $ip, $Port)
+        }
+    }
+    else {
+        Write-Output "SEU Search server starting: http://127.0.0.1:$Port/"
+    }
+    Push-Location $root
+    try {
+        & $venvPython @uvicornArgs
+    }
+    finally {
+        Pop-Location
+    }
     exit $LASTEXITCODE
 }
 
-$logDir = Join-Path $root "backend\data"
-New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-
-$cmdLine = "set EMBEDDING_PROVIDER=$EmbeddingProvider&& start ""SEU Search Server"" /D ""$root"" /MIN ""$python"" -m uvicorn backend.app.web.main:app --host 127.0.0.1 --port $Port"
-Start-Process `
-    -FilePath $env:ComSpec `
-    -ArgumentList @("/c", $cmdLine) `
+$env:EMBEDDING_PROVIDER = $EmbeddingProvider
+$process = Start-Process `
+    -FilePath $venvPython `
+    -ArgumentList $uvicornArgs `
     -WorkingDirectory $root `
-    -WindowStyle Hidden | Out-Null
+    -WindowStyle Hidden `
+    -PassThru
 
-$health = $null
-for ($i = 0; $i -lt 20; $i++) {
+$started = $false
+for ($i = 0; $i -lt 25; $i++) {
+    Start-Sleep -Milliseconds 600
     try {
         $health = Invoke-RestMethod "http://127.0.0.1:$Port/api/health" -TimeoutSec 3
-        break
+        if ($health.ok) {
+            $started = $true
+            break
+        }
     }
     catch {
-        Start-Sleep -Milliseconds 500
     }
 }
 
-if (-not $health) {
+if (-not $started) {
+    if ($process -and -not $process.HasExited) {
+        Stop-Process -Id $process.Id -Force
+    }
     throw "Failed to start server on http://127.0.0.1:$Port/"
 }
 
-Write-Output "SEU Search server started: http://127.0.0.1:$Port/"
-$serverPids = & $netstat -ano |
-    Select-String ":$Port\s+.*LISTENING\s+(\d+)" |
-    ForEach-Object { [regex]::Match($_.Line, "LISTENING\s+(\d+)").Groups[1].Value } |
-    Select-Object -Unique
-if ($serverPids) {
-    Write-Output "PID: $($serverPids -join ', ')"
+if ($Lan) {
+    Write-Output "LAN mode enabled. Remote devices can search, but index management stays local-only."
+    foreach ($ip in (Get-LanAddresses)) {
+        Write-Output ("LAN access: http://{0}:{1}/" -f $ip, $Port)
+    }
 }
-Write-Output "Documents: $($health.documents), chunks: $($health.chunks)"
+else {
+    Write-Output "SEU Search server started: http://127.0.0.1:$Port/"
+}
