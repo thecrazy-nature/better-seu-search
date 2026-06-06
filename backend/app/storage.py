@@ -27,6 +27,8 @@ MAX_SEARCH_TEXT_CHARS = 5000
 MAX_SEGMENTED_TOKENS = 360
 MAX_CHUNK_TAGS = 64
 MAX_EMBEDDING_TEXT_CHARS = 2400
+DEFAULT_COLLECTION_NAME = "Default Index"
+DEFAULT_COLLECTION_SLUG = "default"
 
 try:
     import jieba  # type: ignore
@@ -292,6 +294,7 @@ class DocumentStore:
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def init_db(self) -> None:
@@ -460,12 +463,56 @@ class DocumentStore:
                     error TEXT,
                     traceback TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS collections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    slug TEXT NOT NULL UNIQUE,
+                    description TEXT NOT NULL DEFAULT '',
+                    is_enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS collection_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    collection_id INTEGER NOT NULL,
+                    source_name TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    seed_urls_json TEXT NOT NULL DEFAULT '[]',
+                    include_path_prefixes_json TEXT NOT NULL DEFAULT '[]',
+                    exclude_path_prefixes_json TEXT NOT NULL DEFAULT '[]',
+                    max_depth INTEGER,
+                    max_pages INTEGER,
+                    days_back INTEGER,
+                    is_enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_sources_unique
+                ON collection_sources(collection_id, source_name, base_url);
+
+                CREATE TABLE IF NOT EXISTS collection_documents (
+                    collection_id INTEGER NOT NULL,
+                    document_id INTEGER NOT NULL,
+                    added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (collection_id, document_id),
+                    FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+                    FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_collection_documents_document
+                ON collection_documents(document_id);
                 """
             )
             self._ensure_document_columns(conn)
             self._ensure_chunk_columns(conn)
             self._ensure_chunk_fts_schema(conn)
+            self._ensure_crawl_task_columns(conn)
             self._ensure_source_profiles(conn)
+            self._ensure_collection_schema(conn)
             self._ensure_chunks(conn)
 
     @staticmethod
@@ -558,6 +605,81 @@ class DocumentStore:
             END;
             """
         )
+
+    @staticmethod
+    def _ensure_crawl_task_columns(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(crawl_tasks)").fetchall()}
+        if "collection_id" not in columns:
+            conn.execute("ALTER TABLE crawl_tasks ADD COLUMN collection_id INTEGER")
+
+    def _ensure_collection_schema(self, conn: sqlite3.Connection) -> None:
+        collection_row = conn.execute(
+            "SELECT id FROM collections WHERE slug = ?",
+            (DEFAULT_COLLECTION_SLUG,),
+        ).fetchone()
+        if collection_row is None:
+            conn.execute(
+                """
+                INSERT INTO collections (name, slug, description, is_enabled, updated_at)
+                VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+                """,
+                (
+                    DEFAULT_COLLECTION_NAME,
+                    DEFAULT_COLLECTION_SLUG,
+                    "Default dataset for the built-in search index.",
+                ),
+            )
+            collection_row = conn.execute(
+                "SELECT id FROM collections WHERE slug = ?",
+                (DEFAULT_COLLECTION_SLUG,),
+            ).fetchone()
+
+        default_collection_id = int(collection_row["id"])
+        source_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM collection_sources WHERE collection_id = ?",
+                (default_collection_id,),
+            ).fetchone()["n"]
+        )
+        if source_count == 0:
+            from .crawler.seu_sites import configured_seed_sites
+
+            for site in configured_seed_sites():
+                conn.execute(
+                    """
+                    INSERT INTO collection_sources (
+                        collection_id, source_name, base_url, seed_urls_json,
+                        include_path_prefixes_json, exclude_path_prefixes_json,
+                        max_depth, max_pages, days_back, is_enabled, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, '[]', '[]', ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        default_collection_id,
+                        site["source"],
+                        site["base"],
+                        _json_dump(site["seeds"]),
+                        site.get("max_depth"),
+                        site.get("max_pages"),
+                        site.get("days_back"),
+                    ),
+                )
+
+        membership_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM collection_documents WHERE collection_id = ?",
+                (default_collection_id,),
+            ).fetchone()["n"]
+        )
+        if membership_count == 0:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO collection_documents (collection_id, document_id)
+                SELECT ?, id
+                FROM documents
+                """,
+                (default_collection_id,),
+            )
 
     @staticmethod
     def _ensure_source_profiles(conn: sqlite3.Connection) -> None:
@@ -729,28 +851,409 @@ class DocumentStore:
                 ),
             )
 
-    def count_documents(self) -> int:
+    def list_collections(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        sql = """
+            SELECT c.*,
+                   COUNT(DISTINCT cs.id) AS source_count,
+                   COUNT(DISTINCT cd.document_id) AS document_count,
+                   MAX(t.updated_at) AS last_crawled_at
+            FROM collections c
+            LEFT JOIN collection_sources cs
+              ON cs.collection_id = c.id
+             AND cs.is_enabled = 1
+            LEFT JOIN collection_documents cd
+              ON cd.collection_id = c.id
+            LEFT JOIN crawl_tasks t
+              ON t.collection_id = c.id
+             AND t.status = 'completed'
+            WHERE (? = 0 OR c.is_enabled = 1)
+            GROUP BY c.id
+            ORDER BY CASE WHEN c.slug = ? THEN 0 ELSE 1 END, c.updated_at DESC, c.id DESC
+        """
         with self.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()
+            rows = conn.execute(sql, (1 if enabled_only else 0, DEFAULT_COLLECTION_SLUG)).fetchall()
+        return [_collection_row_to_dict(row) for row in rows]
+
+    def get_collection(self, collection_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT c.*,
+                       COUNT(DISTINCT cs.id) AS source_count,
+                       COUNT(DISTINCT cd.document_id) AS document_count,
+                       MAX(t.updated_at) AS last_crawled_at
+                FROM collections c
+                LEFT JOIN collection_sources cs
+                  ON cs.collection_id = c.id
+                 AND cs.is_enabled = 1
+                LEFT JOIN collection_documents cd
+                  ON cd.collection_id = c.id
+                LEFT JOIN crawl_tasks t
+                  ON t.collection_id = c.id
+                 AND t.status = 'completed'
+                WHERE c.id = ?
+                GROUP BY c.id
+                """,
+                (collection_id,),
+            ).fetchone()
+        return _collection_row_to_dict(row) if row else None
+
+    def get_default_collection(self, enabled_only: bool = False) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            query = """
+                SELECT c.*,
+                       COUNT(DISTINCT cs.id) AS source_count,
+                       COUNT(DISTINCT cd.document_id) AS document_count,
+                       MAX(t.updated_at) AS last_crawled_at
+                FROM collections c
+                LEFT JOIN collection_sources cs
+                  ON cs.collection_id = c.id
+                 AND cs.is_enabled = 1
+                LEFT JOIN collection_documents cd
+                  ON cd.collection_id = c.id
+                LEFT JOIN crawl_tasks t
+                  ON t.collection_id = c.id
+                 AND t.status = 'completed'
+                WHERE c.slug = ?
+            """
+            params: list[Any] = [DEFAULT_COLLECTION_SLUG]
+            if enabled_only:
+                query += " AND c.is_enabled = 1"
+            query += " GROUP BY c.id LIMIT 1"
+            row = conn.execute(query, tuple(params)).fetchone()
+        return _collection_row_to_dict(row) if row else None
+
+    def create_collection(
+        self,
+        name: str,
+        description: str = "",
+        *,
+        slug: str | None = None,
+        is_enabled: bool = True,
+    ) -> dict[str, Any]:
+        name = name.strip()
+        if not name:
+            raise ValueError("Collection name is required.")
+        with self.connect() as conn:
+            slug_value = self._next_collection_slug(conn, slug or name)
+            cursor = conn.execute(
+                """
+                INSERT INTO collections (name, slug, description, is_enabled, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (name, slug_value, description.strip(), 1 if is_enabled else 0),
+            )
+            collection_id = int(cursor.lastrowid)
+        collection = self.get_collection(collection_id)
+        if collection is None:
+            raise ValueError("Failed to create collection.")
+        return collection
+
+    def update_collection(
+        self,
+        collection_id: int,
+        *,
+        name: str,
+        description: str = "",
+        is_enabled: bool = True,
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            existing = conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,)).fetchone()
+            if existing is None:
+                return None
+            conn.execute(
+                """
+                UPDATE collections
+                SET name = ?, description = ?, is_enabled = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (name.strip(), description.strip(), 1 if is_enabled else 0, collection_id),
+            )
+        return self.get_collection(collection_id)
+
+    def delete_collection(self, collection_id: int) -> bool:
+        with self.connect() as conn:
+            existing = conn.execute("SELECT slug FROM collections WHERE id = ?", (collection_id,)).fetchone()
+            if existing is None:
+                return False
+            if existing["slug"] == DEFAULT_COLLECTION_SLUG:
+                raise ValueError("The default collection cannot be deleted.")
+            cursor = conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+        return bool(cursor.rowcount)
+
+    def list_collection_sources(self, collection_id: int, enabled_only: bool = False) -> list[dict[str, Any]]:
+        sql = """
+            SELECT *
+            FROM collection_sources
+            WHERE collection_id = ?
+              AND (? = 0 OR is_enabled = 1)
+            ORDER BY is_enabled DESC, updated_at DESC, id DESC
+        """
+        with self.connect() as conn:
+            rows = conn.execute(sql, (collection_id, 1 if enabled_only else 0)).fetchall()
+        return [_collection_source_row_to_dict(row) for row in rows]
+
+    def create_collection_source(
+        self,
+        collection_id: int,
+        *,
+        source_name: str,
+        base_url: str,
+        seed_urls: list[str],
+        include_path_prefixes: list[str] | None = None,
+        exclude_path_prefixes: list[str] | None = None,
+        max_depth: int | None = None,
+        max_pages: int | None = None,
+        days_back: int | None = None,
+        is_enabled: bool = True,
+    ) -> dict[str, Any]:
+        payload = _normalized_collection_source_payload(
+            collection_id=collection_id,
+            source_name=source_name,
+            base_url=base_url,
+            seed_urls=seed_urls,
+            include_path_prefixes=include_path_prefixes,
+            exclude_path_prefixes=exclude_path_prefixes,
+            max_depth=max_depth,
+            max_pages=max_pages,
+            days_back=days_back,
+            is_enabled=is_enabled,
+        )
+        with self.connect() as conn:
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO collection_sources (
+                        collection_id, source_name, base_url, seed_urls_json,
+                        include_path_prefixes_json, exclude_path_prefixes_json,
+                        max_depth, max_pages, days_back, is_enabled, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        payload["collection_id"],
+                        payload["source_name"],
+                        payload["base_url"],
+                        _json_dump(payload["seed_urls"]),
+                        _json_dump(payload["include_path_prefixes"]),
+                        _json_dump(payload["exclude_path_prefixes"]),
+                        payload["max_depth"],
+                        payload["max_pages"],
+                        payload["days_back"],
+                        1 if payload["is_enabled"] else 0,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("A source with the same name and base URL already exists in this collection.") from exc
+            source_id = int(cursor.lastrowid)
+            row = conn.execute("SELECT * FROM collection_sources WHERE id = ?", (source_id,)).fetchone()
+        if row is None:
+            raise ValueError("Failed to create collection source.")
+        return _collection_source_row_to_dict(row)
+
+    def update_collection_source(
+        self,
+        source_id: int,
+        *,
+        source_name: str,
+        base_url: str,
+        seed_urls: list[str],
+        include_path_prefixes: list[str] | None = None,
+        exclude_path_prefixes: list[str] | None = None,
+        max_depth: int | None = None,
+        max_pages: int | None = None,
+        days_back: int | None = None,
+        is_enabled: bool = True,
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            existing = conn.execute("SELECT * FROM collection_sources WHERE id = ?", (source_id,)).fetchone()
+            if existing is None:
+                return None
+            payload = _normalized_collection_source_payload(
+                collection_id=int(existing["collection_id"]),
+                source_name=source_name,
+                base_url=base_url,
+                seed_urls=seed_urls,
+                include_path_prefixes=include_path_prefixes,
+                exclude_path_prefixes=exclude_path_prefixes,
+                max_depth=max_depth,
+                max_pages=max_pages,
+                days_back=days_back,
+                is_enabled=is_enabled,
+            )
+            try:
+                conn.execute(
+                    """
+                    UPDATE collection_sources
+                    SET source_name = ?,
+                        base_url = ?,
+                        seed_urls_json = ?,
+                        include_path_prefixes_json = ?,
+                        exclude_path_prefixes_json = ?,
+                        max_depth = ?,
+                        max_pages = ?,
+                        days_back = ?,
+                        is_enabled = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        payload["source_name"],
+                        payload["base_url"],
+                        _json_dump(payload["seed_urls"]),
+                        _json_dump(payload["include_path_prefixes"]),
+                        _json_dump(payload["exclude_path_prefixes"]),
+                        payload["max_depth"],
+                        payload["max_pages"],
+                        payload["days_back"],
+                        1 if payload["is_enabled"] else 0,
+                        source_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("A source with the same name and base URL already exists in this collection.") from exc
+            row = conn.execute("SELECT * FROM collection_sources WHERE id = ?", (source_id,)).fetchone()
+        return _collection_source_row_to_dict(row) if row else None
+
+    def delete_collection_source(self, source_id: int) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute("DELETE FROM collection_sources WHERE id = ?", (source_id,))
+        return bool(cursor.rowcount)
+
+    def get_collection_crawl_sites(self, collection_id: int) -> list[dict[str, Any]]:
+        sources = self.list_collection_sources(collection_id, enabled_only=True)
+        return [
+            {
+                "source": source["source_name"],
+                "base": source["base_url"],
+                "seeds": source["seed_urls"] or [source["base_url"]],
+                "include_path_prefixes": source["include_path_prefixes"],
+                "exclude_path_prefixes": source["exclude_path_prefixes"],
+                "max_depth": source["max_depth"],
+                "max_pages": source["max_pages"],
+                "days_back": source["days_back"],
+            }
+            for source in sources
+        ]
+
+    def replace_collection_documents(self, collection_id: int, urls: Iterable[str]) -> int:
+        clean_urls = [url.strip() for url in urls if isinstance(url, str) and url.strip()]
+        with self.connect() as conn:
+            document_ids: list[int] = []
+            if clean_urls:
+                for index in range(0, len(clean_urls), 200):
+                    chunk = clean_urls[index : index + 200]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"SELECT id FROM documents WHERE url IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                    document_ids.extend(int(row["id"]) for row in rows)
+            conn.execute("DELETE FROM collection_documents WHERE collection_id = ?", (collection_id,))
+            if document_ids:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO collection_documents (collection_id, document_id)
+                    VALUES (?, ?)
+                    """,
+                    [(collection_id, document_id) for document_id in document_ids],
+                )
+        return len(document_ids)
+
+    def prune_orphan_documents(self) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM documents
+                WHERE id NOT IN (
+                    SELECT DISTINCT document_id
+                    FROM collection_documents
+                )
+                """
+            )
+        return cursor.rowcount if cursor.rowcount is not None else 0
+
+    def count_documents(self, collection_id: int | None = None) -> int:
+        with self.connect() as conn:
+            if collection_id is None:
+                row = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM collection_documents
+                    WHERE collection_id = ?
+                    """,
+                    (collection_id,),
+                ).fetchone()
             return int(row["n"])
 
-    def get_index_stats(self) -> dict[str, int]:
+    def get_index_stats(self, collection_id: int | None = None) -> dict[str, int]:
         with self.connect() as conn:
-            document_count = int(conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"])
-            chunk_count = int(conn.execute("SELECT COUNT(*) AS n FROM document_chunks").fetchone()["n"])
-            attachment_text_chunks = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS n FROM document_chunks WHERE chunk_kind = 'attachment_text'"
-                ).fetchone()["n"]
-            )
-            rows = conn.execute(
-                """
-                SELECT attachments_json
-                FROM documents
-                WHERE attachments_json IS NOT NULL
-                  AND attachments_json != '[]'
-                """
-            ).fetchall()
+            if collection_id is None:
+                document_count = int(conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"])
+                chunk_count = int(conn.execute("SELECT COUNT(*) AS n FROM document_chunks").fetchone()["n"])
+                attachment_text_chunks = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS n FROM document_chunks WHERE chunk_kind = 'attachment_text'"
+                    ).fetchone()["n"]
+                )
+                rows = conn.execute(
+                    """
+                    SELECT attachments_json
+                    FROM documents
+                    WHERE attachments_json IS NOT NULL
+                      AND attachments_json != '[]'
+                    """
+                ).fetchall()
+            else:
+                document_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS n
+                        FROM collection_documents
+                        WHERE collection_id = ?
+                        """,
+                        (collection_id,),
+                    ).fetchone()["n"]
+                )
+                chunk_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS n
+                        FROM document_chunks c
+                        JOIN collection_documents cd
+                          ON cd.document_id = c.document_id
+                        WHERE cd.collection_id = ?
+                        """,
+                        (collection_id,),
+                    ).fetchone()["n"]
+                )
+                attachment_text_chunks = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS n
+                        FROM document_chunks c
+                        JOIN collection_documents cd
+                          ON cd.document_id = c.document_id
+                        WHERE cd.collection_id = ?
+                          AND c.chunk_kind = 'attachment_text'
+                        """,
+                        (collection_id,),
+                    ).fetchone()["n"]
+                )
+                rows = conn.execute(
+                    """
+                    SELECT d.attachments_json
+                    FROM documents d
+                    JOIN collection_documents cd
+                      ON cd.document_id = d.id
+                    WHERE cd.collection_id = ?
+                      AND d.attachments_json IS NOT NULL
+                      AND d.attachments_json != '[]'
+                    """,
+                    (collection_id,),
+                ).fetchall()
         attachments = [item for row in rows for item in _json_load_list(row["attachments_json"])]
         return {
             "documents": document_count,
@@ -891,11 +1394,12 @@ class DocumentStore:
             conn.execute(
                 """
                 INSERT INTO crawl_tasks (
-                    task_id, status, created_at, updated_at, upserted,
+                    task_id, collection_id, status, created_at, updated_at, upserted,
                     total_documents, error, traceback
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
+                    collection_id = excluded.collection_id,
                     status = excluded.status,
                     updated_at = excluded.updated_at,
                     upserted = excluded.upserted,
@@ -905,6 +1409,7 @@ class DocumentStore:
                 """,
                 (
                     task["task_id"],
+                    task.get("collection_id"),
                     task["status"],
                     task["created_at"],
                     task["updated_at"],
@@ -1065,9 +1570,110 @@ class DocumentStore:
             )
             return cursor.rowcount if cursor.rowcount is not None else 0
 
+    @staticmethod
+    def _next_collection_slug(conn: sqlite3.Connection, raw_value: str) -> str:
+        base = _slugify(raw_value) or "collection"
+        slug = base
+        suffix = 2
+        while conn.execute("SELECT 1 FROM collections WHERE slug = ?", (slug,)).fetchone():
+            slug = f"{base}-{suffix}"
+            suffix += 1
+        return slug
+
 
 def _row_get(row: sqlite3.Row, key: str, default: object = None) -> object:
     return row[key] if key in row.keys() else default
+
+
+def _row_bool(row: sqlite3.Row, key: str, default: bool = False) -> bool:
+    value = _row_get(row, key, 1 if default else 0)
+    return bool(int(value or 0))
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
+    return slug[:60]
+
+
+def _normalized_list(values: Iterable[str] | None) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        item = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not item:
+            continue
+        lowered = item.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        output.append(item)
+    return output
+
+
+def _normalized_collection_source_payload(
+    *,
+    collection_id: int,
+    source_name: str,
+    base_url: str,
+    seed_urls: list[str],
+    include_path_prefixes: list[str] | None,
+    exclude_path_prefixes: list[str] | None,
+    max_depth: int | None,
+    max_pages: int | None,
+    days_back: int | None,
+    is_enabled: bool,
+) -> dict[str, Any]:
+    normalized_source_name = source_name.strip()
+    normalized_base_url = base_url.strip()
+    normalized_seeds = _normalized_list(seed_urls) or [normalized_base_url]
+    if not normalized_source_name:
+        raise ValueError("Source name is required.")
+    if not normalized_base_url:
+        raise ValueError("Base URL is required.")
+    return {
+        "collection_id": collection_id,
+        "source_name": normalized_source_name,
+        "base_url": normalized_base_url,
+        "seed_urls": normalized_seeds,
+        "include_path_prefixes": _normalized_list(include_path_prefixes),
+        "exclude_path_prefixes": _normalized_list(exclude_path_prefixes),
+        "max_depth": max_depth,
+        "max_pages": max_pages,
+        "days_back": days_back,
+        "is_enabled": is_enabled,
+    }
+
+
+def _collection_source_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "collection_id": int(row["collection_id"]),
+        "source_name": row["source_name"],
+        "base_url": row["base_url"],
+        "seed_urls": _json_load_list(row["seed_urls_json"]),
+        "include_path_prefixes": _json_load_list(row["include_path_prefixes_json"]),
+        "exclude_path_prefixes": _json_load_list(row["exclude_path_prefixes_json"]),
+        "max_depth": row["max_depth"],
+        "max_pages": row["max_pages"],
+        "days_back": row["days_back"],
+        "is_enabled": _row_bool(row, "is_enabled", True),
+        "created_at": _row_get(row, "created_at"),
+        "updated_at": _row_get(row, "updated_at"),
+    }
+
+
+def _collection_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "name": row["name"],
+        "slug": row["slug"],
+        "description": row["description"] or "",
+        "is_enabled": _row_bool(row, "is_enabled", True),
+        "source_count": int(_row_get(row, "source_count", 0) or 0),
+        "document_count": int(_row_get(row, "document_count", 0) or 0),
+        "last_crawled_at": _row_get(row, "last_crawled_at"),
+        "updated_at": _row_get(row, "updated_at"),
+    }
 
 
 def _chunk_from_row(row: sqlite3.Row) -> dict[str, object]:

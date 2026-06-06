@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Collection Admin</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell admin-shell">
+      <section class="search-panel">
+        <div class="title-row">
+          <div>
+            <h1 id="adminTitle">Collection Admin</h1>
+            <p id="adminIntro">Manage crawl collections and their source sites.</p>
+          </div>
+          <a class="secondary-link" href="/">Back</a>
+        </div>
+      </section>
+
+      <section id="adminStatus" class="status" hidden></section>
+
+      <section class="admin-grid">
+        <section class="admin-panel">
+          <div class="admin-panel-head">
+            <h2 id="collectionListTitle">Collections</h2>
+            <button id="newCollectionButton" class="secondary-button" type="button">New</button>
+          </div>
+          <div id="collectionList" class="collection-list"></div>
+        </section>
+
+        <section class="admin-panel">
+          <h2 id="collectionEditorTitle">Collection</h2>
+          <form id="collectionForm" class="admin-form">
+            <input id="collectionIdInput" type="hidden" />
+            <label>
+              <span id="collectionNameLabel">Name</span>
+              <input id="collectionNameInput" required maxlength="80" />
+            </label>
+            <label>
+              <span id="collectionDescLabel">Description</span>
+              <textarea id="collectionDescriptionInput" rows="3" maxlength="400"></textarea>
+            </label>
+            <label class="checkbox-row">
+              <input id="collectionEnabledInput" type="checkbox" checked />
+              <span id="collectionEnabledLabel">Enabled</span>
+            </label>
+            <div class="button-row">
+              <button id="saveCollectionButton" type="submit">Save</button>
+              <button id="deleteCollectionButton" class="secondary-button" type="button">Delete</button>
+            </div>
+          </form>
+
+          <div class="admin-divider"></div>
+
+          <div class="admin-panel-head">
+            <h2 id="sourceSectionTitle">Sources</h2>
+            <button id="newSourceButton" class="secondary-button" type="button">New</button>
+          </div>
+          <div id="sourceList" class="source-list"></div>
+
+          <form id="sourceForm" class="admin-form">
+            <input id="sourceIdInput" type="hidden" />
+            <label>
+              <span id="sourceNameLabel">Source Name</span>
+              <input id="sourceNameInput" required maxlength="120" />
+            </label>
+            <label>
+              <span id="sourceBaseLabel">Base URL</span>
+              <input id="sourceBaseInput" required maxlength="300" />
+            </label>
+            <label>
+              <span id="sourceSeedsLabel">Seed URLs</span>
+              <textarea id="sourceSeedsInput" rows="4"></textarea>
+            </label>
+            <label>
+              <span id="sourceIncludeLabel">Include Path Prefixes</span>
+              <textarea id="sourceIncludeInput" rows="3"></textarea>
+            </label>
+            <label>
+              <span id="sourceExcludeLabel">Exclude Path Prefixes</span>
+              <textarea id="sourceExcludeInput" rows="3"></textarea>
+            </label>
+
+            <div class="inline-grid">
+              <label>
+                <span id="sourceDepthLabel">Max Depth</span>
+                <input id="sourceDepthInput" type="number" min="0" max="8" />
+              </label>
+              <label>
+                <span id="sourcePagesLabel">Max Pages</span>
+                <input id="sourcePagesInput" type="number" min="1" max="5000" />
+              </label>
+              <label>
+                <span id="sourceDaysLabel">Days Back</span>
+                <input id="sourceDaysInput" type="number" min="1" max="3650" />
+              </label>
+            </div>
+
+            <label class="checkbox-row">
+              <input id="sourceEnabledInput" type="checkbox" checked />
+              <span id="sourceEnabledLabel">Enabled</span>
+            </label>
+
+            <div class="button-row">
+              <button id="saveSourceButton" type="submit">Save Source</button>
+              <button id="deleteSourceButton" class="secondary-button" type="button">Delete Source</button>
+            </div>
+          </form>
+
+          <div class="admin-divider"></div>
+          <button id="crawlCollectionButton" type="button">Run Crawl For This Collection</button>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/admin-collections.js"></script>
+  </body>
+</html>

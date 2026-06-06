@@ -13,11 +13,23 @@
           <div>
             <h1>东南大学官网智能检索</h1>
             <p>先由 AI 理解你的自然语言，再检索官网公开资料，最后只基于来源总结。</p>
+            <p id="accessHint" class="access-hint" hidden></p>
           </div>
-          <button id="crawlButton" class="secondary-button" type="button">更新索引</button>
+          <div class="title-actions">
+            <a id="manageCollectionsLink" class="secondary-link" href="/admin/collections" hidden>管理数据库集</a>
+            <button id="crawlButton" class="secondary-button" type="button">更新当前数据库集</button>
+          </div>
         </div>
 
         <form id="searchForm" class="search-form">
+          <div id="collectionRow" class="collection-row">
+            <label class="collection-label">
+              <span>当前数据库集</span>
+              <select id="collectionSelect"></select>
+            </label>
+            <span id="collectionMeta" class="collection-meta">正在加载数据库集...</span>
+          </div>
+          <p class="collection-helper">搜索只会在当前选中的数据库集内进行。</p>
           <div class="query-row">
             <input
               id="queryInput"

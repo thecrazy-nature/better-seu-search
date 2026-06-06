@@ -27,6 +27,36 @@ class UserProfile(BaseModel):
     campus: str | None = None
 
 
+class CollectionSourceConfig(BaseModel):
+    id: int | None = None
+    collection_id: int | None = None
+    source_name: str
+    base_url: str
+    seed_urls: list[str] = Field(default_factory=list)
+    include_path_prefixes: list[str] = Field(default_factory=list)
+    exclude_path_prefixes: list[str] = Field(default_factory=list)
+    max_depth: int | None = Field(default=None, ge=0, le=8)
+    max_pages: int | None = Field(default=None, ge=1, le=5000)
+    days_back: int | None = Field(default=None, ge=1, le=3650)
+    is_enabled: bool = True
+
+
+class CollectionSummary(BaseModel):
+    id: int
+    name: str
+    slug: str
+    description: str = ""
+    is_enabled: bool = True
+    source_count: int = 0
+    document_count: int = 0
+    last_crawled_at: str | None = None
+    updated_at: str | None = None
+
+
+class CollectionDetail(CollectionSummary):
+    sources: list[CollectionSourceConfig] = Field(default_factory=list)
+
+
 class QueryPlan(BaseModel):
     intent: Intent = "answer_question"
     confidence: float = Field(default=0.5, ge=0, le=1)

@@ -4,16 +4,25 @@ from .crawler.seu_sites import PublicSiteCrawler
 from .storage import DocumentStore
 
 
-def run_crawl() -> int:
+def run_crawl(collection_id: int | None = None) -> int:
     store = DocumentStore()
     store.init_db()
-    crawler = PublicSiteCrawler()
+    collection = store.get_collection(collection_id) if collection_id is not None else store.get_default_collection()
+    if collection is None:
+        raise ValueError("No collection is available for crawling.")
+    sites = store.get_collection_crawl_sites(collection["id"])
+    if not sites:
+        raise ValueError("This collection has no enabled crawl sources.")
+
+    crawler = PublicSiteCrawler(sites=sites)
     count = 0
     batch = []
+    crawled_urls: list[str] = []
 
     def on_document(doc):
         nonlocal count
         batch.append(doc)
+        crawled_urls.append(doc.url)
         if len(batch) >= 25:
             count += store.upsert_documents(batch)
             print(f"[store] upserted={count}", flush=True)
@@ -23,16 +32,12 @@ def run_crawl() -> int:
     if batch:
         count += store.upsert_documents(batch)
         print(f"[store] upserted={count}", flush=True)
-    skipped_urls = []
-    for site in crawler.report["sites"].values():
-        skipped_urls.extend(item["url"] for item in site.get("skipped_document_pages", []))
-        skipped_urls.extend(site.get("list_pages", []))
-    deleted = store.delete_documents_by_urls(skipped_urls)
-    if deleted:
-        print(f"[store] deleted_non_article={deleted}", flush=True)
-    duplicate_deleted = store.delete_duplicate_documents()
-    if duplicate_deleted:
-        print(f"[store] deleted_duplicates={duplicate_deleted}", flush=True)
+
+    member_count = store.replace_collection_documents(collection["id"], crawled_urls)
+    print(f"[store] collection_members={member_count}", flush=True)
+    orphan_deleted = store.prune_orphan_documents()
+    if orphan_deleted:
+        print(f"[store] deleted_orphans={orphan_deleted}", flush=True)
     crawler.write_report()
     return count
 
