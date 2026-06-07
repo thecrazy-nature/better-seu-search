@@ -661,6 +661,74 @@ class DocumentStore:
                 (source, source_type, weight),
             )
 
+    def _ensure_chunks(self, conn: sqlite3.Connection) -> None:
+        missing_docs = conn.execute(
+            """
+            SELECT d.*
+            FROM documents d
+            LEFT JOIN document_chunks c ON c.document_id = d.id
+            GROUP BY d.id
+            HAVING COUNT(c.id) = 0
+            ORDER BY d.id
+            """
+        ).fetchall()
+        inserted = 0
+        for row in missing_docs:
+            self._insert_chunks(conn, row["id"], row, embed_immediately=False)
+            inserted += 1
+
+        stale_rows = conn.execute(
+            """
+            SELECT d.*,
+                   c.id AS chunk_id,
+                   c.chunk_text AS chunk_text,
+                   c.heading AS heading,
+                   c.page AS page,
+                   c.attachment_name AS attachment_name,
+                   c.chunk_kind AS chunk_kind,
+                   c.search_text AS search_text,
+                   c.tags_json AS tags_json,
+                   c.token_count AS token_count,
+                   c.topics AS chunk_topics
+            FROM document_chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE COALESCE(c.search_text, '') = ''
+               OR COALESCE(c.tags_json, '') = ''
+               OR c.tags_json = '[]'
+               OR COALESCE(c.topics, '') = ''
+               OR COALESCE(c.token_count, 0) = 0
+            ORDER BY c.id
+            """
+        ).fetchall()
+        updated = 0
+        for row in stale_rows:
+            chunk = _chunk_from_row(row)
+            chunk_text = row["chunk_text"] or ""
+            tags = _build_chunk_tags(row, chunk, chunk_text)
+            conn.execute(
+                """
+                UPDATE document_chunks
+                SET search_text = ?,
+                    tags_json = ?,
+                    token_count = ?,
+                    topics = ?
+                WHERE id = ?
+                """,
+                (
+                    _build_chunk_search_text(row, chunk, chunk_text),
+                    _json_dump(tags),
+                    _estimate_token_count(chunk_text),
+                    " ".join(str(item) for item in _json_load_list(row["topics_json"])),
+                    row["chunk_id"],
+                ),
+            )
+            updated += 1
+
+        chunk_count = int(conn.execute("SELECT COUNT(*) AS n FROM document_chunks").fetchone()["n"])
+        fts_count = int(conn.execute("SELECT COUNT(*) AS n FROM document_chunks_fts").fetchone()["n"])
+        if inserted or updated or (chunk_count and fts_count != chunk_count):
+            conn.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('rebuild')")
+
     def rebuild_all_chunks(self, conn: sqlite3.Connection | None = None) -> int:
         if conn is not None:
             docs = conn.execute("SELECT * FROM documents").fetchall()

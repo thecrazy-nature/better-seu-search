@@ -229,6 +229,29 @@ p {
   gap: 14px;
 }
 
+.collection-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+}
+
+.collection-label {
+  min-width: min(320px, 100%);
+  flex: 1 1 320px;
+}
+
+.collection-meta {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.collection-helper {
+  margin: -6px 0 2px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .query-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 112px;
@@ -278,6 +301,19 @@ button:disabled {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 12px;
+}
+
+.profile-grid-single {
+  grid-template-columns: 1fr;
+}
+
+.identity-label {
+  display: grid;
+  gap: 8px;
+}
+
+.identity-label input {
+  width: 100%;
 }
 
 label {
@@ -865,6 +901,11 @@ pre {
   .profile-grid,
   .assistant-grid {
     grid-template-columns: 1fr;
+  }
+
+  .collection-row {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .content-grid {

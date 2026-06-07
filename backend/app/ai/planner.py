@@ -127,8 +127,9 @@ class QueryPlanner:
         data["exclude_terms"] = self._as_list(data.get("exclude_terms")) or self._extract_exclude_terms(user_query)
         data["time_scope"] = data.get("time_scope") or self._extract_time_scope(user_query)
         data["authority_preference"] = data.get("authority_preference") or self._extract_authority_preference(user_query)
+        profile_signals = self._profile_signals(profile)
         for key in ("college", "grade", "student_type"):
-            value = getattr(profile, key, None)
+            value = profile_signals.get(key)
             if value and not data["filters"].get(key):
                 data["filters"][key] = value
         try:
@@ -153,6 +154,9 @@ class QueryPlanner:
     def _apply_safety_normalization(self, plan: QueryPlan, user_query: str, profile: UserProfile) -> QueryPlan:
         """Keep AI understanding intact while filling safety-critical fields."""
         text = user_query.strip()
+        profile_signals = self._profile_signals(profile)
+        profile_text = str(profile_signals.get("identity_text") or "").strip()
+        combined_text = " ".join(part for part in [text, profile_text] if part)
         surface_intent = self._safety_intent_override(text, plan.intent)
         if surface_intent != plan.intent:
             plan.intent = surface_intent
@@ -182,8 +186,8 @@ class QueryPlanner:
             plan.need_answer_summary = True
         plan.output_preset = output_preset_for_intent(plan.intent)
 
-        text_college = self._normalize_college(self._first_match(COLLEGE_RE, text))
-        profile_college = self._normalize_college(profile.college)
+        text_college = self._normalize_college(self._first_match(COLLEGE_RE, combined_text))
+        profile_college = self._normalize_college(profile_signals.get("college"))
         preferred_college = text_college or profile_college
         if preferred_college:
             if not plan.entities.get("college"):
@@ -191,14 +195,14 @@ class QueryPlanner:
             if not plan.filters.get("college"):
                 plan.filters["college"] = preferred_college
         for key in ("grade", "student_type"):
-            value = getattr(profile, key, None)
+            value = profile_signals.get(key)
             if value and not plan.filters.get(key):
                 plan.filters[key] = value
 
         plan.exclude_terms = self._merge_terms(plan.exclude_terms, self._extract_exclude_terms(text))
         plan.time_scope = plan.time_scope or self._extract_time_scope(text)
         plan.authority_preference = self._normalize_college(
-            plan.authority_preference or self._extract_authority_preference(text)
+            plan.authority_preference or self._extract_authority_preference(combined_text)
         )
         plan.entities["requested_slots"] = self._merge_terms(
             self._as_list(plan.entities.get("requested_slots")),
@@ -383,10 +387,51 @@ class QueryPlanner:
         return COLLEGE_ALIASES.get(compact, compact)
 
     @staticmethod
+    def _normalize_student_type(value: str | None) -> str | None:
+        if not value:
+            return None
+        compact = value.replace(" ", "")
+        if compact in {"硕士", "博士"}:
+            return "研究生"
+        return compact
+
+    @staticmethod
+    def _normalize_grade(value: str | None) -> str | None:
+        if not value:
+            return None
+        return value.replace(" ", "")
+
+    @classmethod
+    def _profile_signals(cls, profile: UserProfile) -> dict[str, str | None]:
+        identity_text = (profile.identity_text or "").strip()
+        profile_text = " ".join(
+            value.strip()
+            for value in (identity_text, profile.college, profile.grade, profile.student_type)
+            if isinstance(value, str) and value.strip()
+        )
+        college = cls._normalize_college(profile.college or cls._first_match(COLLEGE_RE, profile_text))
+        grade = cls._normalize_grade(profile.grade or cls._first_match(GRADE_RE, profile_text))
+        student_type = cls._normalize_student_type(
+            profile.student_type or cls._first_match(STUDENT_TYPE_RE, profile_text)
+        )
+        if not student_type and grade:
+            if grade.startswith(("研", "博")):
+                student_type = "研究生"
+            elif grade.startswith("大"):
+                student_type = "本科生"
+        return {
+            "identity_text": identity_text or None,
+            "college": college,
+            "grade": grade,
+            "student_type": student_type,
+        }
+
+    @staticmethod
     def _profile_query_terms(plan: QueryPlan, profile: UserProfile) -> list[str]:
         terms: list[str] = []
+        profile_signals = QueryPlanner._profile_signals(profile)
         for key in ("college", "grade", "student_type"):
-            value = plan.filters.get(key) or plan.entities.get(key) or getattr(profile, key, None)
+            value = plan.filters.get(key) or plan.entities.get(key) or profile_signals.get(key)
             if isinstance(value, str) and value:
                 terms.append(value)
         if any("计算机" in term for term in terms):
@@ -420,6 +465,7 @@ class QueryPlanner:
     @staticmethod
     def _build_retrieval_keywords(text: str, plan: QueryPlan, profile: UserProfile) -> list[str]:
         values: list[str] = []
+        profile_signals = QueryPlanner._profile_signals(profile)
         values.append(plan.normalized_query)
         values.extend(plan.expanded_queries[:10])
         topic = plan.entities.get("topic")
@@ -429,7 +475,7 @@ class QueryPlanner:
             if isinstance(value, str):
                 values.append(value)
         for key in ("college", "grade", "student_type"):
-            value = plan.filters.get(key) or plan.entities.get(key) or getattr(profile, key, None)
+            value = plan.filters.get(key) or plan.entities.get(key) or profile_signals.get(key)
             if isinstance(value, str):
                 values.append(value)
         values.extend(TOKEN_RE.findall(text or ""))
@@ -438,13 +484,14 @@ class QueryPlanner:
     @staticmethod
     def _minimal_retrieval_keywords(plan: QueryPlan, profile: UserProfile) -> list[str]:
         values: list[str] = [plan.normalized_query, *plan.expanded_queries[:8]]
+        profile_signals = QueryPlanner._profile_signals(profile)
         for value in plan.entities.values():
             if isinstance(value, str):
                 values.append(value)
             elif isinstance(value, list):
                 values.extend(str(item) for item in value if item)
         for key in ("college", "grade", "student_type"):
-            value = plan.filters.get(key) or getattr(profile, key, None)
+            value = plan.filters.get(key) or profile_signals.get(key)
             if isinstance(value, str):
                 values.append(value)
         values.extend(QueryPlanner._domain_query_expansions(plan.normalized_query))

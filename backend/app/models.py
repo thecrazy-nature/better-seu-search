@@ -20,6 +20,7 @@ Intent = Literal[
 
 
 class UserProfile(BaseModel):
+    identity_text: str | None = None
     college: str | None = None
     grade: str | None = None
     student_type: str | None = None

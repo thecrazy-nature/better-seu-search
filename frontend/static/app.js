@@ -1,8 +1,6 @@
 const form = document.querySelector("#searchForm");
 const queryInput = document.querySelector("#queryInput");
-const collegeInput = document.querySelector("#collegeInput");
-const gradeInput = document.querySelector("#gradeInput");
-const studentTypeInput = document.querySelector("#studentTypeInput");
+const identityInput = document.querySelector("#identityInput");
 const statusBox = document.querySelector("#status");
 const planPanel = document.querySelector("#planPanel");
 const planJson = document.querySelector("#planJson");
@@ -18,6 +16,8 @@ const resultsPanel = document.querySelector("#resultsPanel");
 const results = document.querySelector("#results");
 const crawlButton = document.querySelector("#crawlButton");
 const accessHint = document.querySelector("#accessHint");
+const collectionSelect = document.querySelector("#collectionSelect");
+const collectionMeta = document.querySelector("#collectionMeta");
 const resultOverlay = document.querySelector("#resultOverlay");
 const closeResults = document.querySelector("#closeResults");
 const resultCount = document.querySelector("#resultCount");
@@ -51,6 +51,8 @@ let canManageIndex = false;
 let currentSortMode = "relevance";
 let currentHits = [];
 let assistantMode = "reimbursement";
+let selectedCollectionId = null;
+let collections = [];
 
 function setStatus(message, visible = true) {
   statusBox.hidden = !visible;
@@ -120,24 +122,131 @@ function applyAccess(access) {
   accessHint.textContent = canManageIndex
     ? ""
     : "局域网访客模式：仅支持搜索与查看结果，不可更新索引。";
+  updateCollectionMeta();
 }
 
 function refreshAccess() {
-  fetch("/api/health")
+  return fetch("/api/health")
     .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
     .then((data) => {
       applyAccess(data.access || {});
-      setStatus(`当前索引中有 ${data.documents} 条官网资料。`, true);
-    })
-    .catch(() => {});
+      return data;
+    });
+}
+
+function normalizeStudentType(value) {
+  if (!value) {
+    return null;
+  }
+  if (/留学生/.test(value)) {
+    return "留学生";
+  }
+  if (/交换生/.test(value)) {
+    return "交换生";
+  }
+  if (/(研究生|硕士|博士|研[一二三]|博[一二三四五])/.test(value)) {
+    return "研究生";
+  }
+  if (/(本科生|大[一二三四五六])/.test(value)) {
+    return "本科生";
+  }
+  return null;
+}
+
+function parseIdentityProfile(rawValue) {
+  const text = String(rawValue || "").trim();
+  if (!text) {
+    return {
+      identity_text: null,
+      college: null,
+      grade: null,
+      student_type: null,
+    };
+  }
+
+  const compactText = text.replace(/\s+/g, "");
+  const collegeMatch = compactText.match(/([\u4e00-\u9fff]{2,24}(?:学院|书院|系))/);
+  const gradeMatch = compactText.match(/(20\d{2}级|大[一二三四五六](?:上|下)?|研[一二三](?:上|下)?|博[一二三四五](?:上|下)?)/);
+  const studentTypeMatch = compactText.match(/(本科生|研究生|硕士|博士|留学生|交换生)/);
+  const normalizedStudentType = normalizeStudentType(studentTypeMatch ? studentTypeMatch[1] : compactText);
+
+  return {
+    identity_text: text,
+    college: collegeMatch ? collegeMatch[1] : null,
+    grade: gradeMatch ? gradeMatch[1] : null,
+    student_type: normalizedStudentType,
+  };
 }
 
 function profilePayload() {
+  const identityProfile = parseIdentityProfile(identityInput?.value);
   return {
-    college: collegeInput.value.trim() || null,
-    grade: gradeInput.value.trim() || null,
-    student_type: studentTypeInput.value || null,
+    identity_text: identityProfile.identity_text,
+    college: identityProfile.college,
+    grade: identityProfile.grade,
+    student_type: identityProfile.student_type,
   };
+}
+
+function currentCollection() {
+  return collections.find((item) => item.id === selectedCollectionId) || null;
+}
+
+function updateCollectionMeta() {
+  if (!collectionMeta) {
+    return;
+  }
+  const collection = currentCollection();
+  if (!collection) {
+    collectionMeta.textContent = "暂无可用数据库集";
+    crawlButton.disabled = true;
+    return;
+  }
+  collectionMeta.textContent = `${Number(collection.document_count || 0)} 篇文档 / ${Number(
+    collection.source_count || 0,
+  )} 个站点`;
+  crawlButton.disabled = !canManageIndex;
+}
+
+function renderCollections() {
+  if (!collectionSelect) {
+    return;
+  }
+  collectionSelect.innerHTML = "";
+  if (!collections.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "暂无可用数据库集";
+    collectionSelect.appendChild(option);
+    collectionSelect.disabled = true;
+    selectedCollectionId = null;
+    updateCollectionMeta();
+    return;
+  }
+
+  if (!collections.some((item) => item.id === selectedCollectionId)) {
+    selectedCollectionId = collections[0].id;
+  }
+
+  collectionSelect.disabled = false;
+  for (const collection of collections) {
+    const option = document.createElement("option");
+    option.value = String(collection.id);
+    option.textContent = collection.name;
+    option.selected = collection.id === selectedCollectionId;
+    collectionSelect.appendChild(option);
+  }
+  updateCollectionMeta();
+}
+
+function refreshCollections() {
+  return fetch("/api/collections")
+    .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+    .then((data) => {
+      collections = data.collections || [];
+      renderCollections();
+      return data;
+    });
 }
 
 function escapeHtml(value) {
@@ -447,6 +556,10 @@ async function runAssistant() {
 }
 
 async function runSearch(query) {
+  if (!selectedCollectionId) {
+    setStatus("请先选择一个数据库集。");
+    return;
+  }
   const submitButton = form.querySelector('button[type="submit"]');
   submitButton.disabled = true;
   resetResultPanels();
@@ -463,6 +576,7 @@ async function runSearch(query) {
         profile: profilePayload(),
         limit: 20,
         session_id: searchSessionId,
+        collection_id: selectedCollectionId,
       }),
     });
     if (!response.ok) {
@@ -482,7 +596,13 @@ async function runSearch(query) {
     planPanel.hidden = false;
     answerPanel.hidden = false;
     resultsPanel.hidden = false;
-    setStatus(`完成：找到 ${data.hits.length} 条候选来源。`, true);
+    const collectionName = data.collection_name || currentCollection()?.name || "";
+    setStatus(
+      collectionName
+        ? `完成：已在 ${collectionName} 中找到 ${data.hits.length} 条候选来源。`
+        : `完成：找到 ${data.hits.length} 条候选来源。`,
+      true,
+    );
   } catch (error) {
     answerText.textContent = `检索失败：${error.message}`;
     setStatus(`检索失败：${error.message}`);
@@ -496,6 +616,14 @@ form.addEventListener("submit", (event) => {
   const query = queryInput.value.trim();
   if (query) runSearch(query);
 });
+
+if (collectionSelect) {
+  collectionSelect.addEventListener("change", () => {
+    selectedCollectionId = Number(collectionSelect.value || 0) || null;
+    searchSessionId = null;
+    updateCollectionMeta();
+  });
+}
 
 document.querySelectorAll("[data-query]").forEach((button) => {
   button.addEventListener("click", () => {
@@ -552,10 +680,14 @@ crawlButton.addEventListener("click", async () => {
     setStatus("局域网访客模式下仅支持搜索，不能更新索引。");
     return;
   }
+  if (!selectedCollectionId) {
+    setStatus("请先选择一个数据库集。");
+    return;
+  }
   crawlButton.disabled = true;
   setStatus("索引更新任务已提交，正在等待后台开始...");
   try {
-    const response = await fetch("/api/crawl", { method: "POST" });
+    const response = await fetch(`/api/collections/${selectedCollectionId}/crawl`, { method: "POST" });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -597,4 +729,16 @@ async function pollCrawlTask(taskId) {
   }
 }
 
-refreshAccess();
+Promise.all([refreshAccess(), refreshCollections()])
+  .then(([health]) => {
+    if (!collections.length) {
+      setStatus("还没有启用的数据集，请先在本机管理页面创建一个。");
+      return;
+    }
+    if (Number(health.documents || 0) === 0) {
+      setStatus("当前索引还是空的。可以先选择一个数据库集，再执行索引更新。");
+      return;
+    }
+    setStatus(`当前索引中有 ${health.documents} 条官网资料，可在上方切换数据库集。`, true);
+  })
+  .catch(() => {});

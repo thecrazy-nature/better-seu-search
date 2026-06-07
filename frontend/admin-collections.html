@@ -4,117 +4,247 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Collection Admin</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260606-1" />
-    <link rel="stylesheet" href="/static/admin-collections.css?v=20260606-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260607-admin-1" />
+    <link rel="stylesheet" href="/static/admin-collections.css?v=20260607-admin-1" />
   </head>
-  <body>
-    <main class="shell admin-shell">
-      <section class="search-panel">
-        <div class="title-row">
-          <div>
-            <h1 id="adminTitle">Collection Admin</h1>
-            <p id="adminIntro">Manage crawl collections and their source sites.</p>
+  <body class="admin-page">
+    <div class="site-chrome">
+      <header class="top-strip">
+        <div class="official-width">
+          <span>东南大学教务处</span>
+          <nav aria-label="辅助链接">
+            <a href="https://www.seu.edu.cn/" target="_blank" rel="noreferrer">东南大学</a>
+            <a href="https://jwc.seu.edu.cn/" target="_blank" rel="noreferrer">教务处官网</a>
+          </nav>
+        </div>
+      </header>
+
+      <header class="brand-header">
+        <div class="official-width brand-inner">
+          <div class="brand-mark">
+            <span class="school-name">东南大学</span>
+            <strong>教务处</strong>
           </div>
-          <a class="secondary-link" href="/">Back</a>
+          <div class="brand-meta">Office of Academic Affairs, Southeast University</div>
+        </div>
+      </header>
+
+      <nav class="main-nav" aria-label="官网栏目">
+        <div class="official-width nav-grid">
+          <a href="/">首页</a>
+          <a>机构设置</a>
+          <a>规章制度</a>
+          <a>教学运行</a>
+          <a>学籍管理</a>
+          <a>实践教学</a>
+          <a>下载专区</a>
+          <a>数据管理</a>
+        </div>
+      </nav>
+    </div>
+
+    <main>
+      <section class="hero admin-hero">
+        <div class="official-width admin-hero-layout">
+          <section class="search-panel admin-intro-card">
+            <div class="search-heading">
+              <span class="eyebrow">本机管理</span>
+              <h1 id="adminTitle">Collection Admin</h1>
+              <p id="adminIntro">Manage crawl collections and their source sites.</p>
+            </div>
+
+            <div class="admin-hero-actions">
+              <a class="secondary-link admin-back-link" href="/">Back</a>
+              <span class="admin-local-badge">仅本机可编辑</span>
+            </div>
+
+            <div class="admin-hero-pills">
+              <article class="admin-hero-pill">
+                <strong>先配置，再入库</strong>
+                <p>保存站点和范围后，再由服务器端手动触发更新。</p>
+              </article>
+              <article class="admin-hero-pill">
+                <strong>远端只读</strong>
+                <p>局域网访客只能搜索已开放的数据集，不能改配置。</p>
+              </article>
+              <article class="admin-hero-pill">
+                <strong>按集管理</strong>
+                <p>每个数据集都有自己的站点清单、范围和入库节奏。</p>
+              </article>
+            </div>
+          </section>
+
+          <aside class="notice-board admin-notice-board" aria-label="操作提示">
+            <div class="notice-tabs">
+              <span class="active">操作提示</span>
+              <span>配置建议</span>
+            </div>
+            <article>
+              <time>01</time>
+              <p>优先把栏目页、站点地图、专题页放进 Seed URL，不要只依赖首页。</p>
+            </article>
+            <article>
+              <time>02</time>
+              <p>包含路径只匹配 URL path，不匹配 query 参数，路径范围收太窄会漏抓。</p>
+            </article>
+            <article>
+              <time>03</time>
+              <p>数据集启用后才会出现在搜索首页，下线时建议先停用再清理配置。</p>
+            </article>
+          </aside>
         </div>
       </section>
 
-      <section id="adminStatus" class="status" hidden></section>
+      <section class="official-width admin-feedback">
+        <section id="adminStatus" class="admin-status" hidden></section>
+      </section>
 
-      <section class="admin-grid">
-        <section class="admin-panel">
-          <div class="admin-panel-head">
-            <h2 id="collectionListTitle">Collections</h2>
-            <button id="newCollectionButton" class="secondary-button" type="button">New</button>
-          </div>
-          <div id="collectionList" class="collection-list"></div>
-        </section>
-
-        <section class="admin-panel">
-          <h2 id="collectionEditorTitle">Collection</h2>
-          <form id="collectionForm" class="admin-form">
-            <input id="collectionIdInput" type="hidden" />
-            <label>
-              <span id="collectionNameLabel">Name</span>
-              <input id="collectionNameInput" required maxlength="80" />
-            </label>
-            <label>
-              <span id="collectionDescLabel">Description</span>
-              <textarea id="collectionDescriptionInput" rows="3" maxlength="400"></textarea>
-            </label>
-            <label class="checkbox-row">
-              <input id="collectionEnabledInput" type="checkbox" checked />
-              <span id="collectionEnabledLabel">Enabled</span>
-            </label>
-            <div class="button-row">
-              <button id="saveCollectionButton" type="submit">Save</button>
-              <button id="deleteCollectionButton" class="secondary-button" type="button">Delete</button>
+      <section class="official-width admin-workbench">
+        <aside class="admin-sidebar">
+          <section class="admin-card admin-card-sticky">
+            <div class="admin-panel-head">
+              <div>
+                <span class="eyebrow">数据集列表</span>
+                <h2 id="collectionListTitle">Collections</h2>
+              </div>
+              <button id="newCollectionButton" class="secondary-action" type="button">New</button>
             </div>
-          </form>
+            <p class="admin-card-copy">已启用的数据集会出现在首页搜索下拉框中。</p>
+            <div id="collectionList" class="collection-list"></div>
+          </section>
 
-          <div class="admin-divider"></div>
+          <section class="admin-card admin-run-card">
+            <div class="admin-panel-head">
+              <div>
+                <span class="eyebrow">索引更新</span>
+                <h2>更新当前数据集</h2>
+              </div>
+            </div>
+            <p class="admin-card-copy">
+              只会对当前选中的数据集执行 crawl 和入库，不会影响其他数据集。
+            </p>
+            <button id="crawlCollectionButton" class="primary-action" type="button">
+              Run Crawl For This Collection
+            </button>
+          </section>
+        </aside>
 
-          <div class="admin-panel-head">
-            <h2 id="sourceSectionTitle">Sources</h2>
-            <button id="newSourceButton" class="secondary-button" type="button">New</button>
-          </div>
-          <div id="sourceList" class="source-list"></div>
-
-          <form id="sourceForm" class="admin-form">
-            <input id="sourceIdInput" type="hidden" />
-            <label>
-              <span id="sourceNameLabel">Source Name</span>
-              <input id="sourceNameInput" required maxlength="120" />
-            </label>
-            <label>
-              <span id="sourceBaseLabel">Base URL</span>
-              <input id="sourceBaseInput" required maxlength="300" />
-            </label>
-            <label>
-              <span id="sourceSeedsLabel">Seed URLs</span>
-              <textarea id="sourceSeedsInput" rows="4"></textarea>
-            </label>
-            <label>
-              <span id="sourceIncludeLabel">Include Path Prefixes</span>
-              <textarea id="sourceIncludeInput" rows="3"></textarea>
-            </label>
-            <label>
-              <span id="sourceExcludeLabel">Exclude Path Prefixes</span>
-              <textarea id="sourceExcludeInput" rows="3"></textarea>
-            </label>
-
-            <div class="inline-grid">
-              <label>
-                <span id="sourceDepthLabel">Max Depth</span>
-                <input id="sourceDepthInput" type="number" min="0" max="8" />
-              </label>
-              <label>
-                <span id="sourcePagesLabel">Max Pages</span>
-                <input id="sourcePagesInput" type="number" min="1" max="5000" />
-              </label>
-              <label>
-                <span id="sourceDaysLabel">Days Back</span>
-                <input id="sourceDaysInput" type="number" min="1" max="3650" />
-              </label>
+        <section class="admin-main">
+          <section class="admin-card">
+            <div class="admin-panel-head">
+              <div>
+                <span class="eyebrow">数据集信息</span>
+                <h2 id="collectionEditorTitle">Collection</h2>
+              </div>
             </div>
 
-            <label class="checkbox-row">
-              <input id="sourceEnabledInput" type="checkbox" checked />
-              <span id="sourceEnabledLabel">Enabled</span>
-            </label>
+            <form id="collectionForm" class="admin-form">
+              <input id="collectionIdInput" type="hidden" />
+              <div class="admin-form-grid">
+                <label class="admin-field">
+                  <span id="collectionNameLabel">Name</span>
+                  <input id="collectionNameInput" required maxlength="80" />
+                </label>
+                <label class="admin-field admin-field-wide">
+                  <span id="collectionDescLabel">Description</span>
+                  <textarea id="collectionDescriptionInput" rows="3" maxlength="400"></textarea>
+                </label>
+              </div>
 
-            <div class="button-row">
-              <button id="saveSourceButton" type="submit">Save Source</button>
-              <button id="deleteSourceButton" class="secondary-button" type="button">Delete Source</button>
+              <label class="admin-toggle">
+                <input id="collectionEnabledInput" type="checkbox" checked />
+                <span id="collectionEnabledLabel">Enabled</span>
+              </label>
+
+              <div class="admin-actions">
+                <button id="saveCollectionButton" class="primary-action" type="submit">Save</button>
+                <button id="deleteCollectionButton" class="secondary-action" type="button">
+                  Delete
+                </button>
+              </div>
+            </form>
+          </section>
+
+          <section class="admin-card">
+            <div class="admin-panel-head">
+              <div>
+                <span class="eyebrow">站点配置</span>
+                <h2 id="sourceSectionTitle">Sources</h2>
+              </div>
+              <button id="newSourceButton" class="secondary-action" type="button">New</button>
             </div>
-          </form>
 
-          <div class="admin-divider"></div>
-          <button id="crawlCollectionButton" type="button">Run Crawl For This Collection</button>
+            <div class="admin-help-grid">
+              <article class="admin-help-card">
+                <strong>包含路径</strong>
+                <p>适合限制到通知、办事指南、政策公开等栏目，避免首页全站漫游。</p>
+              </article>
+              <article class="admin-help-card">
+                <strong>抓取深度与页数</strong>
+                <p>先用较小范围试跑，确认命中内容正确后，再逐步放宽规模。</p>
+              </article>
+            </div>
+
+            <div id="sourceList" class="source-list"></div>
+
+            <form id="sourceForm" class="admin-form">
+              <input id="sourceIdInput" type="hidden" />
+
+              <div class="admin-form-grid">
+                <label class="admin-field">
+                  <span id="sourceNameLabel">Source Name</span>
+                  <input id="sourceNameInput" required maxlength="120" />
+                </label>
+                <label class="admin-field">
+                  <span id="sourceBaseLabel">Base URL</span>
+                  <input id="sourceBaseInput" required maxlength="300" />
+                </label>
+                <label class="admin-field admin-field-wide">
+                  <span id="sourceSeedsLabel">Seed URLs</span>
+                  <textarea id="sourceSeedsInput" rows="4"></textarea>
+                </label>
+                <label class="admin-field">
+                  <span id="sourceIncludeLabel">Include Path Prefixes</span>
+                  <textarea id="sourceIncludeInput" rows="3"></textarea>
+                </label>
+                <label class="admin-field">
+                  <span id="sourceExcludeLabel">Exclude Path Prefixes</span>
+                  <textarea id="sourceExcludeInput" rows="3"></textarea>
+                </label>
+              </div>
+
+              <div class="admin-inline-grid">
+                <label class="admin-field">
+                  <span id="sourceDepthLabel">Max Depth</span>
+                  <input id="sourceDepthInput" type="number" min="0" max="8" />
+                </label>
+                <label class="admin-field">
+                  <span id="sourcePagesLabel">Max Pages</span>
+                  <input id="sourcePagesInput" type="number" min="1" max="5000" />
+                </label>
+                <label class="admin-field">
+                  <span id="sourceDaysLabel">Days Back</span>
+                  <input id="sourceDaysInput" type="number" min="1" max="3650" />
+                </label>
+              </div>
+
+              <label class="admin-toggle">
+                <input id="sourceEnabledInput" type="checkbox" checked />
+                <span id="sourceEnabledLabel">Enabled</span>
+              </label>
+
+              <div class="admin-actions">
+                <button id="saveSourceButton" class="primary-action" type="submit">Save Source</button>
+                <button id="deleteSourceButton" class="secondary-action" type="button">
+                  Delete Source
+                </button>
+              </div>
+            </form>
+          </section>
         </section>
       </section>
     </main>
 
-    <script src="/static/admin-collections.js?v=20260606-1"></script>
+    <script src="/static/admin-collections.js?v=20260607-admin-1"></script>
   </body>
 </html>
